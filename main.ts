@@ -56,6 +56,111 @@ app.get('/debug', (_req: Request, res: Response) => {
   res.json({ files: fileList, count: files.length });
 });
 
+// ✅ НОВЫЙ ЭНДПОИНТ: Сохранить сессию после QR-авторизации
+app.post('/drom/save-qr-session', async (req: Request, res: Response) => {
+  const { login, password } = req.body;
+  
+  if (!login || !password) {
+    return res.status(400).json({ error: 'login и password обязательны для идентификации сессии' });
+  }
+  
+  console.log('📱 Сохраняем сессию после QR-авторизации для:', login.substring(0, 3) + '***');
+  
+  try {
+    const browser = await chromium.launch({
+      headless: false, // ✅ НЕ headless - чтобы вы могли сканировать QR
+      args: ['--no-sandbox', '--disable-setuid-sandbox']
+    });
+
+    const context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      viewport: { width: 1920, height: 1080 },
+      locale: 'ru-RU',
+      timezoneId: 'Asia/Yekaterinburg'
+    });
+
+    const page = await context.newPage();
+    
+    console.log('🔐 Переход на страницу входа...');
+    await page.goto('https://my.drom.ru/sign', { waitUntil: 'networkidle', timeout: 30000 });
+    await page.waitForTimeout(2000);
+    
+    // Вводим логин/пароль чтобы увидеть QR
+    await page.fill('input[name="sign"]', login);
+    await page.waitForTimeout(800);
+    
+    await page.fill('input[type="password"]', password);
+    await page.waitForTimeout(800);
+    
+    await page.click('button:has-text("Войти с паролем")');
+    await page.waitForTimeout(3000);
+    
+    console.log('📱 Откройте браузер и отсканируйте QR-код в Telegram!');
+    console.log('⏳ Ожидание успешной авторизации (макс 120 сек)...');
+    
+    // Ждём успешного входа (максимум 2 минуты)
+    let isLoggedIn = false;
+    let attempts = 0;
+    const maxAttempts = 40; // 40 * 3 сек = 120 сек
+    
+    while (!isLoggedIn && attempts < maxAttempts) {
+      await page.waitForTimeout(3000);
+      
+      const currentUrl = page.url();
+      isLoggedIn = currentUrl.includes('/personal') && !currentUrl.includes('/sign');
+      
+      if (isLoggedIn) {
+        console.log('✅ Успешный вход через QR!');
+        break;
+      }
+      
+      attempts++;
+      if (attempts % 10 === 0) {
+        console.log(`⏳ Ждём... (${attempts * 3} сек)`);
+      }
+    }
+    
+    if (!isLoggedIn) {
+      await browser.close();
+      return res.status(408).json({
+        success: false,
+        error: 'Timeout: QR-код не был отсканирован за 120 секунд'
+      });
+    }
+    
+    // Сохраняем cookies
+    const cookies = await context.cookies();
+    const sessionPath = getSessionPath(login);
+    
+    fs.writeFileSync(sessionPath, JSON.stringify({
+      cookies: cookies,
+      timestamp: Date.now(),
+      login: login.substring(0, 3) + '***',
+      verified: true,
+      method: 'qr-code'
+    }, null, 2));
+    
+    console.log('✅ Сессия сохранена:', sessionPath);
+    
+    await browser.close();
+    
+    res.json({
+      success: true,
+      message: 'Сессия успешно сохранена после QR-авторизации',
+      sessionPath: sessionPath,
+      cookiesCount: cookies.length,
+      expiresIn: '7 дней'
+    });
+    
+  } catch (error: any) {
+    console.error('❌ Ошибка:', error.message);
+    res.status(500).json({ 
+      success: false,
+      error: error.message
+    });
+  }
+});
+
 async function loginToDrom(
   page: any, 
   login: string, 
@@ -66,7 +171,7 @@ async function loginToDrom(
   const sessionPath = getSessionPath(login);
   
   // Проверяем сохранённую сессию
-  if (fs.existsSync(sessionPath) && !verificationCode) {
+  if (fs.existsSync(sessionPath)) {
     console.log('🔄 Загружаем сохранённую сессию...');
     try {
       const sessionData = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
@@ -119,12 +224,10 @@ async function loginToDrom(
     const currentUrl = page.url();
     console.log('📍 URL после входа:', currentUrl);
     
-    // Детальная проверка страницы
     const pageAnalysis = await page.evaluate(() => {
       const bodyText = document.body.innerText;
       const allClickableElements: any[] = [];
       
-      // Ищем все кликабельные элементы
       const selectors = ['button', 'a', 'div[onclick]', 'span[onclick]', '[role="button"]'];
       selectors.forEach(selector => {
         document.querySelectorAll(selector).forEach(el => {
@@ -152,6 +255,9 @@ async function loginToDrom(
         needsVerification: bodyText.includes('Подтверждение') || 
                           bodyText.includes('Telegram') ||
                           bodyText.includes('код'),
+        hasQRCode: bodyText.includes('QR') || 
+                   !!document.querySelector('canvas') ||
+                   !!document.querySelector('img[alt*="QR"]'),
         clickableElements: allClickableElements,
         telegramElements: allClickableElements.filter(el => el.hasTelegram),
         codeElements: allClickableElements.filter(el => el.hasCode)
@@ -161,13 +267,12 @@ async function loginToDrom(
     console.log('🔍 Анализ страницы:', {
       url: pageAnalysis.url,
       needsVerification: pageAnalysis.needsVerification,
-      telegramElementsCount: pageAnalysis.telegramElements.length
+      hasQRCode: pageAnalysis.hasQRCode
     });
     
     if (pageAnalysis.needsVerification) {
       console.log('📱 Требуется подтверждение устройства');
       
-      // Сохраняем скриншот и HTML ДО клика
       const timestamp = Date.now();
       const screenshotFilename = `verification_${timestamp}.png`;
       const htmlFilename = `verification_${timestamp}.html`;
@@ -178,155 +283,39 @@ async function loginToDrom(
       const html = await page.content();
       fs.writeFileSync(htmlPath, html, 'utf8');
       
-      console.log('📸 Скриншот ДО клика сохранён:', screenshotPath);
-      console.log('📄 HTML ДО клика сохранён:', htmlPath);
+      console.log('📸 Скриншот сохранён:', screenshotPath);
       
       const debugInfo: any = {
         screenshotUrl: `/debug/${screenshotFilename}`,
         htmlUrl: `/debug/${htmlFilename}`,
-        screenshotPath: screenshotPath,
-        htmlPath: htmlPath,
+        hasQRCode: pageAnalysis.hasQRCode,
         telegramElements: pageAnalysis.telegramElements,
-        allClickableElements: pageAnalysis.clickableElements.slice(0, 20),
-        bodyPreview: pageAnalysis.bodyText
+        recommendation: pageAnalysis.hasQRCode ? 
+          'Обнаружен QR-код! Используйте эндпоинт POST /drom/save-qr-session для авторизации через QR' :
+          'Используйте код из Telegram'
       };
       
-      if (!verificationCode) {
-        // Кликаем по элементу <a> с классом telegram-send-phone-btn
-        let clicked = false;
-        
-        console.log('📲 Найдено элементов с "Telegram":', pageAnalysis.telegramElements.length);
-        console.log('Элементы:', pageAnalysis.telegramElements);
-        
-        // Способ 1: Клик по классу telegram-send-phone-btn
-        try {
-          clicked = await page.evaluate(() => {
-            const telegramBtn = document.querySelector('.telegram-send-phone-btn');
-            if (telegramBtn && telegramBtn instanceof HTMLElement) {
-              console.log('Кликаем по .telegram-send-phone-btn');
-              telegramBtn.click();
-              return true;
-            }
-            return false;
-          });
-          
-          if (clicked) {
-            console.log('✅ Нажат элемент .telegram-send-phone-btn через evaluate');
-            await page.waitForTimeout(3000);
-          }
-        } catch (e: any) {
-          console.log('⚠️ Ошибка клика через класс:', e.message);
-        }
-        
-        // Способ 2: Playwright клик по ссылке
-        if (!clicked) {
-          try {
-            await page.click('a.telegram-send-phone-btn', { timeout: 3000 });
-            console.log('✅ Нажат через Playwright a.telegram-send-phone-btn');
-            clicked = true;
-            await page.waitForTimeout(3000);
-          } catch (e) {
-            console.log('⚠️ Не удалось нажать через Playwright селектор');
-          }
-        }
-        
-        // Способ 3: Клик по тексту
-        if (!clicked) {
-          try {
-            await page.click('text=Проверить через Telegram', { timeout: 3000 });
-            console.log('✅ Нажат через text=Проверить через Telegram');
-            clicked = true;
-            await page.waitForTimeout(3000);
-          } catch (e) {
-            console.log('⚠️ Не удалось нажать через текст');
-          }
-        }
-        
-        // Способ 4: Универсальный поиск <a> с Telegram
-        if (!clicked) {
-          try {
-            clicked = await page.evaluate(() => {
-              const links = Array.from(document.querySelectorAll('a'));
-              const telegramLink = links.find(a => 
-                a.textContent?.includes('Telegram') && 
-                a.offsetParent !== null
-              );
-              
-              if (telegramLink) {
-                console.log('Кликаем по ссылке:', telegramLink.textContent);
-                telegramLink.click();
-                return true;
-              }
-              return false;
-            });
-            
-            if (clicked) {
-              console.log('✅ Нажата ссылка с Telegram через универсальный поиск');
-              await page.waitForTimeout(3000);
-            }
-          } catch (e) {
-            console.log('⚠️ Универсальный поиск не сработал');
-          }
-        }
-        
-        // ✅ ДОБАВЛЕНО: Скриншот ПОСЛЕ клика по кнопке Telegram
-        if (clicked) {
-          console.log('✅ Элемент Telegram нажат! Делаем скриншот после клика...');
-          
-          const afterClickFilename = `after_telegram_click_${timestamp}.png`;
-          const afterClickHtmlFilename = `after_telegram_click_${timestamp}.html`;
-          const afterClickPath = path.join(DEBUG_DIR, afterClickFilename);
-          const afterClickHtmlPath = path.join(DEBUG_DIR, afterClickHtmlFilename);
-          
-          await page.screenshot({ path: afterClickPath, fullPage: true });
-          const afterClickHtml = await page.content();
-          fs.writeFileSync(afterClickHtmlPath, afterClickHtml, 'utf8');
-          
-          console.log('📸 Скриншот ПОСЛЕ клика сохранён:', afterClickPath);
-          console.log('📄 HTML ПОСЛЕ клика сохранён:', afterClickHtmlPath);
-          
-          // Добавляем в debugInfo
-          debugInfo.afterClickScreenshotUrl = `/debug/${afterClickFilename}`;
-          debugInfo.afterClickHtmlUrl = `/debug/${afterClickHtmlFilename}`;
-          debugInfo.afterClickScreenshotPath = afterClickPath;
-          debugInfo.afterClickHtmlPath = afterClickHtmlPath;
-          
-          // Анализируем страницу после клика
-          const afterClickAnalysis = await page.evaluate(() => {
-            const bodyText = document.body.innerText;
-            return {
-              url: window.location.href,
-              bodyPreview: bodyText.substring(0, 1000),
-              hasCodeInput: !!document.querySelector('input[type="text"], input[type="tel"], input[type="number"]'),
-              hasTelegramMessage: bodyText.includes('Telegram') || bodyText.includes('код'),
-              hasErrorMessage: bodyText.toLowerCase().includes('ошибка') || 
-                              bodyText.toLowerCase().includes('неверный'),
-              hasSuccessMessage: bodyText.toLowerCase().includes('отправлен') ||
-                                bodyText.toLowerCase().includes('проверьте')
-            };
-          });
-          
-          console.log('🔍 Анализ после клика:', afterClickAnalysis);
-          debugInfo.afterClickAnalysis = afterClickAnalysis;
-          
-          console.log('✅ Проверьте Telegram и скриншот после клика');
-        } else {
-          console.log('❌ Не удалось автоматически нажать элемент Telegram');
-        }
-        
-        return { 
-          success: false, 
+      if (pageAnalysis.hasQRCode && !verificationCode) {
+        return {
+          success: false,
           needsVerification: true,
-          message: clicked ? 
-            'Код отправлен в Telegram! Проверьте бота и введите код в поле verificationCode. Проверьте afterClickScreenshotUrl для подтверждения.' :
-            'Не удалось нажать кнопку Telegram. Проверьте debug файлы.',
+          message: 'Обнаружен QR-код для авторизации. Используйте эндпоинт POST /drom/save-qr-session { login, password } для сохранения сессии после сканирования QR.',
           debug: debugInfo
         };
       }
       
-      // Вводим код подтверждения
-      console.log('🔢 Вводим код подтверждения:', verificationCode);
+      // Остальной код для Telegram кода...
+      if (!verificationCode) {
+        return { 
+          success: false, 
+          needsVerification: true,
+          message: 'Требуется код подтверждения из Telegram или используйте QR-авторизацию',
+          debug: debugInfo
+        };
+      }
       
+      // Ввод кода...
+      console.log('🔢 Вводим код подтверждения:', verificationCode);
       await page.waitForTimeout(2000);
       
       const inputFilled = await page.evaluate((code: string) => {
@@ -349,7 +338,7 @@ async function loginToDrom(
         console.log('✅ Код введён');
         await page.waitForTimeout(1000);
         
-        const submitClicked = await page.evaluate(() => {
+        await page.evaluate(() => {
           const buttons = Array.from(document.querySelectorAll('button, [type="submit"], a'));
           const submitBtn = buttons.find(btn => {
             const text = (btn.textContent || '').toLowerCase();
@@ -363,24 +352,13 @@ async function loginToDrom(
           
           if (submitBtn && submitBtn instanceof HTMLElement) {
             submitBtn.click();
-            return true;
           }
-          return false;
         });
         
-        if (submitClicked) {
-          console.log('✅ Кнопка подтверждения нажата');
-          await page.waitForTimeout(3000);
-        } else {
-          console.log('⚠️ Кнопка не найдена, возможно автопроверка');
-          await page.waitForTimeout(2000);
-        }
-      } else {
-        console.log('❌ Не удалось найти поле ввода кода');
+        await page.waitForTimeout(3000);
       }
     }
     
-    // Проверяем финальный результат
     await page.waitForTimeout(2000);
     const finalUrl = page.url();
     console.log('📍 Финальный URL:', finalUrl);
@@ -635,4 +613,5 @@ app.listen(PORT, () => {
   console.log(`🚀 Drom automation service на порту ${PORT}`);
   console.log(`📍 Health: http://localhost:${PORT}/health`);
   console.log(`📍 Debug files: http://localhost:${PORT}/debug`);
+  console.log(`📍 QR Login: POST http://localhost:${PORT}/drom/save-qr-session`);
 });
