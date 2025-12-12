@@ -72,13 +72,15 @@ async function loginToDrom(
       const sessionData = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
       const sessionAge = Date.now() - sessionData.timestamp;
       
-      if (sessionAge < 7 * 24 * 60 * 60 * 1000) {
+      if (sessionAge < 30 * 24 * 60 * 60 * 1000) { // 30 дней
         await context.addCookies(sessionData.cookies);
         
         await page.goto('https://my.drom.ru/personal/', { 
           waitUntil: 'domcontentloaded', 
           timeout: 15000 
         });
+        
+        await page.waitForTimeout(2000);
         
         const isLoggedIn = await page.evaluate(() => {
           return !document.body.innerText.includes('Войти') && 
@@ -89,14 +91,18 @@ async function loginToDrom(
           console.log('✅ Сессия валидна');
           return { success: true, needsVerification: false };
         } else {
-          console.log('⚠️ Сессия устарела');
+          console.log('⚠️ Сессия устарела, удаляем');
           fs.unlinkSync(sessionPath);
         }
       } else {
+        console.log('⚠️ Сессия слишком старая, удаляем');
         fs.unlinkSync(sessionPath);
       }
-    } catch (e) {
-      console.log('⚠️ Ошибка загрузки сессии');
+    } catch (e: any) {
+      console.log('⚠️ Ошибка загрузки сессии:', e.message);
+      if (fs.existsSync(sessionPath)) {
+        fs.unlinkSync(sessionPath);
+      }
     }
   }
   
@@ -153,6 +159,7 @@ async function loginToDrom(
                           bodyText.includes('код'),
         clickableElements: allClickableElements,
         telegramElements: allClickableElements.filter(el => el.hasTelegram),
+        phoneElements: allClickableElements.filter(el => el.hasPhone),
         codeElements: allClickableElements.filter(el => el.hasCode)
       };
     });
@@ -160,7 +167,7 @@ async function loginToDrom(
     console.log('🔍 Анализ страницы:', {
       url: pageAnalysis.url,
       needsVerification: pageAnalysis.needsVerification,
-      telegramElementsCount: pageAnalysis.telegramElements.length
+      phoneElementsCount: pageAnalysis.phoneElements.length
     });
     
     if (pageAnalysis.needsVerification) {
@@ -178,74 +185,83 @@ async function loginToDrom(
       fs.writeFileSync(htmlPath, html, 'utf8');
       
       console.log('📸 Скриншот ДО клика сохранён:', screenshotPath);
-      console.log('📄 HTML ДО клика сохранён:', htmlPath);
       
       const debugInfo: any = {
         screenshotUrl: `/debug/${screenshotFilename}`,
         htmlUrl: `/debug/${htmlFilename}`,
         screenshotPath: screenshotPath,
         htmlPath: htmlPath,
-        telegramElements: pageAnalysis.telegramElements,
-        allClickableElements: pageAnalysis.clickableElements.slice(0, 20),
+        phoneElements: pageAnalysis.phoneElements,
+        allClickableElements: pageAnalysis.clickableElements.slice(0, 30),
         bodyPreview: pageAnalysis.bodyText
       };
       
       if (!verificationCode) {
-        // Кликаем по элементу Telegram
+        // Кликаем по кнопке "Отправить код на телефон"
         let clicked = false;
         
-        console.log('📲 Найдено элементов с "Telegram":', pageAnalysis.telegramElements.length);
-        console.log('Элементы:', pageAnalysis.telegramElements);
+        console.log('📞 Найдено элементов с "телефон":', pageAnalysis.phoneElements.length);
+        console.log('Элементы:', pageAnalysis.phoneElements);
         
-        // Способ 1: Клик по классу telegram-send-phone-btn
+        // Способ 1: Клик по тексту "Отправить код на телефон"
         try {
-          clicked = await page.evaluate(() => {
-            const telegramBtn = document.querySelector('.telegram-send-phone-btn');
-            if (telegramBtn && telegramBtn instanceof HTMLElement) {
-              console.log('Кликаем по .telegram-send-phone-btn');
-              telegramBtn.click();
-              return true;
+          await page.click('text=Отправить код на телефон', { timeout: 3000 });
+          console.log('✅ Нажат через text=Отправить код на телефон');
+          clicked = true;
+          await page.waitForTimeout(5000);
+        } catch (e) {
+          console.log('⚠️ Не удалось нажать через текст "Отправить код на телефон"');
+        }
+        
+        // Способ 2: Клик по частичному тексту "телефон"
+        if (!clicked) {
+          try {
+            await page.click('text=телефон', { timeout: 3000 });
+            console.log('✅ Нажат через text=телефон');
+            clicked = true;
+            await page.waitForTimeout(5000);
+          } catch (e) {
+            console.log('⚠️ Не удалось нажать через text=телефон');
+          }
+        }
+        
+        // Способ 3: Универсальный поиск через evaluate
+        if (!clicked) {
+          try {
+            clicked = await page.evaluate(() => {
+              const allElements = Array.from(document.querySelectorAll('a, button'));
+              const phoneElement = allElements.find(el => {
+                const text = (el.textContent || '').toLowerCase();
+                const visible = (el as HTMLElement).offsetParent !== null;
+                return visible && (
+                  text.includes('отправить код на телефон') ||
+                  text.includes('код на телефон') ||
+                  (text.includes('телефон') && text.includes('код'))
+                );
+              });
+              
+              if (phoneElement && phoneElement instanceof HTMLElement) {
+                console.log('Кликаем по элементу:', phoneElement.textContent);
+                phoneElement.click();
+                return true;
+              }
+              return false;
+            });
+            
+            if (clicked) {
+              console.log('✅ Нажат элемент через универсальный поиск');
+              await page.waitForTimeout(5000);
             }
-            return false;
-          });
-          
-          if (clicked) {
-            console.log('✅ Нажат элемент .telegram-send-phone-btn через evaluate');
-            await page.waitForTimeout(5000);
-          }
-        } catch (e: any) {
-          console.log('⚠️ Ошибка клика через класс:', e.message);
-        }
-        
-        // Способ 2: Playwright клик по ссылке
-        if (!clicked) {
-          try {
-            await page.click('a.telegram-send-phone-btn', { timeout: 3000 });
-            console.log('✅ Нажат через Playwright a.telegram-send-phone-btn');
-            clicked = true;
-            await page.waitForTimeout(5000);
           } catch (e) {
-            console.log('⚠️ Не удалось нажать через Playwright селектор');
-          }
-        }
-        
-        // Способ 3: Клик по тексту
-        if (!clicked) {
-          try {
-            await page.click('text=Проверить через Telegram', { timeout: 3000 });
-            console.log('✅ Нажат через text=Проверить через Telegram');
-            clicked = true;
-            await page.waitForTimeout(5000);
-          } catch (e) {
-            console.log('⚠️ Не удалось нажать через текст');
+            console.log('⚠️ Универсальный поиск не сработал');
           }
         }
         
         // СКРИНШОТ ПОСЛЕ КЛИКА
-        console.log('📸 Делаем скриншот ПОСЛЕ попытки клика...');
+        console.log('📸 Делаем скриншот ПОСЛЕ клика по кнопке телефона...');
         
-        const afterClickFilename = `after_telegram_click_${timestamp}.png`;
-        const afterClickHtmlFilename = `after_telegram_click_${timestamp}.html`;
+        const afterClickFilename = `after_phone_click_${timestamp}.png`;
+        const afterClickHtmlFilename = `after_phone_click_${timestamp}.html`;
         const afterClickPath = path.join(DEBUG_DIR, afterClickFilename);
         const afterClickHtmlPath = path.join(DEBUG_DIR, afterClickHtmlFilename);
         
@@ -254,15 +270,10 @@ async function loginToDrom(
         fs.writeFileSync(afterClickHtmlPath, afterClickHtml, 'utf8');
         
         console.log('📸 Скриншот ПОСЛЕ клика сохранён:', afterClickPath);
-        console.log('📄 HTML ПОСЛЕ клика сохранён:', afterClickHtmlPath);
         
         // Детальный анализ страницы после клика
         const afterClickAnalysis = await page.evaluate(() => {
           const bodyText = document.body.innerText;
-          
-          const hasQRCode = !!document.querySelector('canvas') || 
-                            !!document.querySelector('img[src*="qr"]') ||
-                            bodyText.includes('QR');
           
           const inputs = Array.from(document.querySelectorAll('input'));
           const codeInput = inputs.find(inp => 
@@ -273,13 +284,12 @@ async function loginToDrom(
           
           const hasSentMessage = bodyText.toLowerCase().includes('отправлен') ||
                                 bodyText.toLowerCase().includes('проверьте') ||
-                                bodyText.toLowerCase().includes('введите код');
+                                bodyText.toLowerCase().includes('введите код') ||
+                                bodyText.toLowerCase().includes('смс');
           
           return {
             url: window.location.href,
-            bodyText: bodyText,
             bodyPreview: bodyText.substring(0, 1500),
-            hasQRCode: hasQRCode,
             hasCodeInput: !!codeInput,
             codeInputDetails: codeInput ? {
               type: codeInput.type,
@@ -287,37 +297,31 @@ async function loginToDrom(
               name: codeInput.name,
               id: codeInput.id
             } : null,
-            hasTelegramMessage: bodyText.includes('Telegram'),
+            hasSentMessage: hasSentMessage,
             hasErrorMessage: bodyText.toLowerCase().includes('ошибка') || 
-                            bodyText.toLowerCase().includes('неверный'),
-            hasSentMessage: hasSentMessage
+                            bodyText.toLowerCase().includes('неверный')
           };
         });
         
         console.log('🔍 ДЕТАЛЬНЫЙ анализ после клика:');
         console.log('  - URL:', afterClickAnalysis.url);
-        console.log('  - Есть QR код:', afterClickAnalysis.hasQRCode);
         console.log('  - Есть поле ввода кода:', afterClickAnalysis.hasCodeInput);
         console.log('  - Есть сообщение об отправке:', afterClickAnalysis.hasSentMessage);
-        console.log('  - Превью текста страницы:', afterClickAnalysis.bodyPreview.substring(0, 200));
+        console.log('  - Превью:', afterClickAnalysis.bodyPreview.substring(0, 200));
         
         // Добавляем в debugInfo
         debugInfo.afterClickScreenshotUrl = `/debug/${afterClickFilename}`;
         debugInfo.afterClickHtmlUrl = `/debug/${afterClickHtmlFilename}`;
-        debugInfo.afterClickScreenshotPath = afterClickPath;
-        debugInfo.afterClickHtmlPath = afterClickHtmlPath;
         debugInfo.afterClickAnalysis = afterClickAnalysis;
         debugInfo.clicked = clicked;
         
         let message = '';
-        if (afterClickAnalysis.hasQRCode) {
-          message = '⚠️ Обнаружен QR-код! Дром показывает QR вместо отправки кода в Telegram. Откройте afterClickScreenshotUrl и отсканируйте QR-код в Telegram, затем сделайте новый запрос.';
-        } else if (afterClickAnalysis.hasSentMessage) {
-          message = '✅ Код должен быть отправлен в Telegram! Проверьте бота @dromru или личные сообщения. Введите код в поле verificationCode.';
+        if (afterClickAnalysis.hasSentMessage) {
+          message = '✅ SMS код должен быть отправлен на телефон! Проверьте SMS и введите код в поле verificationCode.';
         } else if (afterClickAnalysis.hasCodeInput) {
-          message = '⚠️ Поле ввода кода найдено, но нет подтверждения отправки. Проверьте Telegram и скриншот afterClickScreenshotUrl.';
+          message = '⚠️ Поле ввода кода найдено. Проверьте SMS на телефоне и введите код в поле verificationCode.';
         } else {
-          message = `⚠️ Клик ${clicked ? 'выполнен' : 'НЕ выполнен'}. Проверьте скриншот afterClickScreenshotUrl чтобы понять что произошло.`;
+          message = `⚠️ Клик ${clicked ? 'выполнен' : 'НЕ выполнен'}. Проверьте скриншот afterClickScreenshotUrl.`;
         }
         
         return { 
@@ -344,6 +348,7 @@ async function loginToDrom(
           codeInput.value = code;
           codeInput.dispatchEvent(new Event('input', { bubbles: true }));
           codeInput.dispatchEvent(new Event('change', { bubbles: true }));
+          console.log('Код введён в поле:', codeInput.name || codeInput.id);
           return true;
         }
         return false;
@@ -351,7 +356,7 @@ async function loginToDrom(
       
       if (inputFilled) {
         console.log('✅ Код введён');
-        await page.waitForTimeout(1000);
+        await page.waitForTimeout(1500);
         
         const submitClicked = await page.evaluate(() => {
           const buttons = Array.from(document.querySelectorAll('button, [type="submit"], a'));
@@ -361,11 +366,13 @@ async function loginToDrom(
             return visible && (
               text.includes('подтвердить') || 
               text.includes('войти') ||
+              text.includes('отправить') ||
               btn.getAttribute('type') === 'submit'
             );
           });
           
           if (submitBtn && submitBtn instanceof HTMLElement) {
+            console.log('Нажимаем кнопку:', submitBtn.textContent);
             submitBtn.click();
             return true;
           }
@@ -374,13 +381,18 @@ async function loginToDrom(
         
         if (submitClicked) {
           console.log('✅ Кнопка подтверждения нажата');
-          await page.waitForTimeout(3000);
+          await page.waitForTimeout(4000);
         } else {
-          console.log('⚠️ Кнопка не найдена, возможно автопроверка');
-          await page.waitForTimeout(2000);
+          console.log('⚠️ Кнопка подтверждения не найдена, ждём автопроверки');
+          await page.waitForTimeout(3000);
         }
       } else {
         console.log('❌ Не удалось найти поле ввода кода');
+        
+        // Делаем скриншот при ошибке
+        const errorScreenshot = path.join(DEBUG_DIR, `error_no_input_${Date.now()}.png`);
+        await page.screenshot({ path: errorScreenshot, fullPage: true });
+        console.log('📸 Скриншот ошибки сохранён:', errorScreenshot);
       }
     }
     
@@ -392,15 +404,22 @@ async function loginToDrom(
     const isSuccess = finalUrl.includes('/personal') && !finalUrl.includes('/sign');
     
     if (isSuccess) {
+      console.log('🎉 Успешный вход! Сохраняем сессию...');
+      
       const cookies = await context.cookies();
+      
       fs.writeFileSync(sessionPath, JSON.stringify({
         cookies: cookies,
         timestamp: Date.now(),
         login: login.substring(0, 3) + '***',
-        verified: true
+        verified: true,
+        userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
       }, null, 2));
       
       console.log('✅ Авторизация успешна, сессия сохранена');
+      console.log('📁 Путь к сессии:', sessionPath);
+      console.log('🍪 Cookies сохранено:', cookies.length);
+      
       return { success: true, needsVerification: false };
     }
     
@@ -421,7 +440,7 @@ async function loginToDrom(
     return { 
       success: false, 
       needsVerification: false, 
-      message: 'Неизвестная ошибка авторизации' 
+      message: 'Неизвестная ошибка авторизации. URL: ' + finalUrl
     };
     
   } catch (error: any) {
