@@ -133,6 +133,7 @@ async function loginToDrom(page: any, login: string, password: string, context: 
   }
 }
 
+// НОВЫЙ ПОДХОД: Перехватываем API запросы
 app.post('/drom/get-messages', async (req: Request, res: Response) => {
   const { login, password } = req.body;
   
@@ -143,7 +144,7 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
   console.log('🔍 Получаем сообщения с Дром для:', login.substring(0, 3) + '***');
   
   let screenshotBase64 = '';
-  let debugInfo: any = {};
+  let apiDialogs: any = null;
   
   try {
     const browser = await chromium.launch({
@@ -164,125 +165,109 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
 
     const page = await context.newPage();
     
+    // Перехватываем все network requests
+    page.on('response', async (response: any) => {
+      const url = response.url();
+      
+      // Ищем API запросы с диалогами
+      if (url.includes('/api/') || url.includes('dialog') || url.includes('message')) {
+        console.log('🌐 API запрос:', url);
+        
+        try {
+          const contentType = response.headers()['content-type'] || '';
+          if (contentType.includes('application/json')) {
+            const json = await response.json();
+            console.log('📦 JSON ответ:', JSON.stringify(json).substring(0, 500));
+            
+            // Если это диалоги - сохраняем
+            if (json && (json.dialogs || json.data || Array.isArray(json))) {
+              apiDialogs = json;
+              console.log('✅ Найдены данные диалогов через API!');
+            }
+          }
+        } catch (e) {
+          // Не JSON или ошибка парсинга
+        }
+      }
+    });
+    
     await loginToDrom(page, login, password, context);
     
     console.log('💬 Открываем чаты...');
     await page.goto('https://my.drom.ru/personal/messaging-modal?switchPosition=dialogs', { 
-      waitUntil: 'load',
+      waitUntil: 'networkidle',
       timeout: 30000 
     });
     
     console.log('📍 URL:', page.url());
     
-    await page.waitForTimeout(3000);
-    
-    console.log('⏳ Ждём появления диалогов...');
-    
-    // Вынес evaluate в отдельную функцию для типизации
-    const dialogs: any = await page.evaluate(() => {
-      return new Promise((resolve) => {
-        let attempts = 0;
-        const maxAttempts = 30;
-        
-        function checkDialogs() {
-          const dialogElements = document.querySelectorAll('.dialog-list__li');
-          
-          if (dialogElements.length > 0) {
-            console.log('Диалоги найдены!', dialogElements.length);
-            
-            const chats = [] as any[];
-            
-            dialogElements.forEach((li, idx) => {
-              const dialogBrief = li.querySelector('.dialog-brief');
-              const linkElement = li.querySelector('.dialog-list__link');
-              
-              if (!dialogBrief || !linkElement) return;
-              
-              const dialogId = dialogBrief.getAttribute('data-dialog-id');
-              const interlocutor = dialogBrief.getAttribute('data-interlocutor');
-              const latestMessage = dialogBrief.querySelector('.dialog-brief__latest_msg')?.textContent?.trim();
-              const userName = dialogBrief.querySelector('.dialog-brief__interlocutor')?.textContent?.trim();
-              const time = dialogBrief.querySelector('.bzr-dialog__message-dt')?.textContent?.trim();
-              const avatarStyle = dialogBrief.querySelector('.dialog-brief__image')?.getAttribute('style');
-              const avatarUrl = avatarStyle?.match(/url\((.*?)\)/)?.[1]?.replace(/['"]/g, '');
-              
-              chats.push({
-                id: idx,
-                dialogId: dialogId,
-                interlocutor: interlocutor || userName,
-                userName: userName,
-                latestMessage: latestMessage,
-                time: time,
-                avatar: avatarUrl,
-                chatUrl: (linkElement as HTMLAnchorElement).href,
-                unread: li.classList.contains('unread') || li.classList.contains('new')
-              });
-            });
-            
-            resolve(chats);
-            return;
-          }
-          
-          attempts++;
-          
-          if (attempts >= maxAttempts) {
-            console.log('Превышено время ожидания');
-            resolve([]);
-            return;
-          }
-          
-          setTimeout(checkDialogs, 1000);
-        }
-        
-        checkDialogs();
-        
-        const observer = new MutationObserver(() => {
-          const hasDialogList = document.querySelector('.dialog-list__li');
-          if (hasDialogList) {
-            console.log('MutationObserver: диалоги появились!');
-            checkDialogs();
-          }
-        });
-        
-        observer.observe(document.body, {
-          childList: true,
-          subtree: true
-        });
-      });
-    });
-    
-    console.log(`✅ Результат: ${Array.isArray(dialogs) ? dialogs.length : 0} диалогов`);
+    // Ждём все запросы
+    await page.waitForTimeout(10000);
     
     const screenshotBuffer = await page.screenshot({ fullPage: true });
     screenshotBase64 = screenshotBuffer.toString('base64');
     
-    if (!Array.isArray(dialogs) || dialogs.length === 0) {
-      debugInfo.html_body = await page.evaluate(() => document.body.innerHTML.substring(0, 3000));
-      debugInfo.all_classes = await page.evaluate(() => {
-        const elements = document.querySelectorAll('[class*="dialog"]');
-        const result = [] as any[];
-        for (let i = 0; i < Math.min(elements.length, 10); i++) {
-          const el = elements[i];
-          result.push({
-            tag: el.tagName,
-            classes: el.className,
-            text: el.textContent?.substring(0, 100)
-          });
-        }
-        return result;
+    // Если перехватили API - используем его
+    if (apiDialogs) {
+      console.log('✅ Используем данные из API');
+      await browser.close();
+      
+      return res.json({
+        success: true,
+        source: 'api',
+        currentUrl: page.url(),
+        apiData: apiDialogs,
+        screenshotBase64: screenshotBase64
       });
     }
+    
+    // Если не перехватили - парсим DOM (старый способ)
+    console.log('⚠️ API данных нет, парсим DOM...');
+    
+    const dialogs: any = await page.evaluate(() => {
+      const chats = [] as any[];
+      const dialogElements = document.querySelectorAll('.dialog-list__li');
+      
+      dialogElements.forEach((li, idx) => {
+        const dialogBrief = li.querySelector('.dialog-brief');
+        const linkElement = li.querySelector('.dialog-list__link');
+        
+        if (!dialogBrief || !linkElement) return;
+        
+        const dialogId = dialogBrief.getAttribute('data-dialog-id');
+        const interlocutor = dialogBrief.getAttribute('data-interlocutor');
+        const latestMessage = dialogBrief.querySelector('.dialog-brief__latest_msg')?.textContent?.trim();
+        const userName = dialogBrief.querySelector('.dialog-brief__interlocutor')?.textContent?.trim();
+        const time = dialogBrief.querySelector('.bzr-dialog__message-dt')?.textContent?.trim();
+        const avatarStyle = dialogBrief.querySelector('.dialog-brief__image')?.getAttribute('style');
+        const avatarUrl = avatarStyle?.match(/url\((.*?)\)/)?.[1]?.replace(/['"]/g, '');
+        
+        chats.push({
+          id: idx,
+          dialogId: dialogId,
+          interlocutor: interlocutor || userName,
+          userName: userName,
+          latestMessage: latestMessage,
+          time: time,
+          avatar: avatarUrl,
+          chatUrl: (linkElement as HTMLAnchorElement).href,
+          unread: li.classList.contains('unread') || li.classList.contains('new')
+        });
+      });
+      
+      return chats;
+    });
     
     await browser.close();
     
     res.json({ 
       success: true,
+      source: 'dom',
       currentUrl: page.url(),
       count: Array.isArray(dialogs) ? dialogs.length : 0,
       dialogs: dialogs || [],
       screenshotBase64: screenshotBase64,
-      usedCache: fs.existsSync(getSessionPath(login)),
-      debug: debugInfo
+      usedCache: fs.existsSync(getSessionPath(login))
     });
     
   } catch (error: any) {
@@ -291,8 +276,7 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
       success: false,
       error: error.message, 
       stack: error.stack,
-      screenshotBase64: screenshotBase64 || 'not_captured',
-      debug: debugInfo
+      screenshotBase64: screenshotBase64 || 'not_captured'
     });
   }
 });
