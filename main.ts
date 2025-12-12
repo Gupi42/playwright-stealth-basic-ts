@@ -411,7 +411,7 @@ async function loginToDrom(
       console.log('⏳ Обнаружена промежуточная страница /sign/s2/, ждём финального редиректа...');
       
       try {
-        await page.waitForURL(url => !url.includes('/sign'), { timeout: 10000 });
+        await page.waitForURL((url: string) => !url.includes('/sign'), { timeout: 10000 });
         finalUrl = page.url();
         console.log('✅ Финальный редирект выполнен:', finalUrl);
       } catch (e) {
