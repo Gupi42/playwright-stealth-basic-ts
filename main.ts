@@ -32,22 +32,21 @@ app.get('/health', (_req: Request, res: Response) => {
 });
 
 // Функция авторизации с сохранением сессии
+// В функции loginToDrom после авторизации добавьте доп. проверку:
 async function loginToDrom(page: any, login: string, password: string, context: any) {
   const sessionPath = getSessionPath(login);
   
-  // Пытаемся загрузить существующую сессию
   if (fs.existsSync(sessionPath)) {
     console.log('🔄 Загружаем сохранённую сессию...');
     try {
       const sessionData = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
       const sessionAge = Date.now() - sessionData.timestamp;
       
-      // Проверяем, не старше ли сессия 24 часов
       if (sessionAge < 24 * 60 * 60 * 1000) {
         await context.addCookies(sessionData.cookies);
         
-        // Проверяем валидность сессии
-        await page.goto('https://my.drom.ru/personal/messaging-modal?switchPosition=dialogs', { 
+        // Проверка сессии - используем простой URL
+        await page.goto('https://www.drom.ru/personal/messaging/', { 
           waitUntil: 'domcontentloaded', 
           timeout: 15000 
         });
@@ -58,23 +57,21 @@ async function loginToDrom(page: any, login: string, password: string, context: 
         });
         
         if (isLoggedIn) {
-          console.log('✅ Сессия валидна, авторизация не требуется');
+          console.log('✅ Сессия валидна');
           return;
         } else {
-          console.log('⚠️ Сессия устарела, выполняем новый вход...');
+          console.log('⚠️ Сессия устарела');
           fs.unlinkSync(sessionPath);
         }
       } else {
-        console.log('⚠️ Сессия старше 24 часов, удаляем...');
         fs.unlinkSync(sessionPath);
       }
     } catch (e) {
-      console.log('⚠️ Ошибка загрузки сессии:', e);
+      console.log('⚠️ Ошибка загрузки сессии');
     }
   }
   
-  // Выполняем новую авторизацию
-  console.log('🔐 Выполняем авторизацию на Дром...');
+  console.log('🔐 Авторизация на Дром...');
   
   try {
     await page.goto('https://my.drom.ru/sign', { waitUntil: 'networkidle', timeout: 30000 });
@@ -88,16 +85,37 @@ async function loginToDrom(page: any, login: string, password: string, context: 
     
     await page.click('button:has-text("Войти с паролем")');
     
-    try {
-      await page.waitForNavigation({ timeout: 30000, waitUntil: 'networkidle' });
-    } catch (navError) {
-      console.log('⚠️ Навигация не произошла');
+    // ВАЖНО: Ждём финального редиректа (может быть несколько)
+    let redirectAttempts = 0;
+    while (redirectAttempts < 5) {
+      try {
+        await page.waitForNavigation({ timeout: 10000, waitUntil: 'networkidle' });
+        console.log(`🔄 Редирект ${redirectAttempts + 1}: ${page.url()}`);
+        
+        // Если попали на промежуточную страницу /sign/s2/ - ждём ещё
+        if (page.url().includes('/sign/s2/')) {
+          console.log('⏳ Промежуточная страница, ждём...');
+          await page.waitForTimeout(3000);
+          redirectAttempts++;
+          continue;
+        }
+        
+        // Если уже не на странице входа - выходим
+        if (!page.url().includes('/sign')) {
+          break;
+        }
+        
+        redirectAttempts++;
+      } catch (e) {
+        console.log('⚠️ Навигация завершена');
+        break;
+      }
     }
     
     await page.waitForTimeout(3000);
     
     const currentUrl = page.url();
-    console.log('📍 URL после входа:', currentUrl);
+    console.log('📍 Финальный URL после входа:', currentUrl);
     
     // Проверяем ошибки
     const hasError = await page.evaluate(() => {
@@ -107,19 +125,18 @@ async function loginToDrom(page: any, login: string, password: string, context: 
     });
     
     if (hasError) {
-      throw new Error('Ошибка авторизации - неверные данные или капча');
+      throw new Error('Ошибка авторизации');
     }
     
     // Сохраняем сессию
     const cookies = await context.cookies();
-    const sessionData = {
+    fs.writeFileSync(sessionPath, JSON.stringify({
       cookies: cookies,
       timestamp: Date.now(),
       login: login.substring(0, 3) + '***'
-    };
+    }, null, 2));
     
-    fs.writeFileSync(sessionPath, JSON.stringify(sessionData, null, 2));
-    console.log('✅ Сессия сохранена в', sessionPath);
+    console.log('✅ Авторизация завершена, сессия сохранена');
     
   } catch (error: any) {
     console.error('❌ Ошибка авторизации:', error.message);
