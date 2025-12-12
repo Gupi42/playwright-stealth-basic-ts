@@ -109,20 +109,42 @@ async function loginToDrom(
     if (pageState.needsVerification) {
       console.log('📱 Требуется подтверждение устройства');
       
-      if (!verificationCode) {
-        // Автоматически выбираем Telegram если доступен
-        if (pageState.hasTelegramButton) {
-          console.log('📲 Нажимаем "Проверить через Telegram"...');
-          await page.click('button:has-text("Проверить через Telegram")');
-          await page.waitForTimeout(2000);
-        }
-        
-        return { 
-          success: false, 
-          needsVerification: true,
-          message: 'Требуется код подтверждения из Telegram. Отправьте запрос повторно с полем verificationCode'
-        };
+ if (!verificationCode) {
+    // Универсальный клик по элементу с текстом "Telegram"
+    try {
+      console.log('📲 Ищем и нажимаем элемент с "Telegram"...');
+      
+      // Способ 1: Playwright селектор (работает с любым элементом)
+      await page.click('text=Telegram', { timeout: 5000 });
+      console.log('✅ Нажат элемент с текстом "Telegram"');
+      await page.waitForTimeout(2000);
+    } catch (e1) {
+      try {
+        // Способ 2: JavaScript клик
+        await page.evaluate(() => {
+          const elements = Array.from(document.querySelectorAll('*'));
+          const telegramEl = elements.find(el => 
+            el.textContent?.includes('Telegram') && 
+            (el as HTMLElement).offsetParent !== null
+          );
+          if (telegramEl && telegramEl instanceof HTMLElement) {
+            telegramEl.click();
+          }
+        });
+        console.log('✅ Нажат элемент Telegram через JavaScript');
+        await page.waitForTimeout(2000);
+      } catch (e2) {
+        console.log('⚠️ Не удалось автоматически нажать кнопку Telegram');
+        console.log('Возможно, кнопка уже нажата или страница изменилась');
       }
+    }
+    
+    return { 
+      success: false, 
+      needsVerification: true,
+      message: 'Требуется код подтверждения из Telegram. Код должен быть отправлен в ваш Telegram бот. Повторите запрос с полем verificationCode'
+    };
+  }
       
       // Вводим код подтверждения
       console.log('🔢 Вводим код подтверждения:', verificationCode);
