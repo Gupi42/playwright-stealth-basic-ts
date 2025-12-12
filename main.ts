@@ -123,7 +123,7 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
     
     // Переход в сообщения
     console.log('💬 Открываем чаты...');
-    await page.goto('https://www.drom.ru/my/messages/', { 
+    await page.goto('https://my.drom.ru/personal/messaging-modal?switchPosition=dialogs', { 
       waitUntil: 'networkidle',
       timeout: 30000 
     });
