@@ -177,164 +177,80 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
 
     const page = await context.newPage();
     
-    // Логируем все console.log из браузера
-    page.on('console', (msg: any) => {
-      console.log('🌐 Browser console:', msg.text());
-    });
-    
     // Авторизация
     await loginToDrom(page, login, password, context);
     
     // Переход в сообщения
-    console.log('💬 Переходим на страницу сообщений...');
+    console.log('💬 Открываем чаты...');
     await page.goto('https://my.drom.ru/personal/messaging-modal?switchPosition=dialogs', { 
-      waitUntil: 'domcontentloaded',
+      waitUntil: 'networkidle',
       timeout: 30000 
     });
     
     debugInfo.url_after_goto = page.url();
     console.log('📍 URL после goto:', debugInfo.url_after_goto);
     
-    // Ждём 3 секунды для начальной загрузки
-    await page.waitForTimeout(3000);
+    // КЛЮЧЕВОЙ МОМЕНТ: Ждём, пока JavaScript отрендерит контент
+    // Из HTML видно, что есть div#inbox-static-container, внутри которого список
+    console.log('⏳ Ждём рендеринг inbox-static-container...');
     
-    // DEBUG: Проверяем, есть ли на странице нужные элементы
-    debugInfo.page_analysis = await page.evaluate(() => {
-      return {
-        hasDialogList: !!document.querySelector('.dialog-list'),
-        hasDialogListLi: !!document.querySelector('.dialog-list__li'),
-        dialogListLiCount: document.querySelectorAll('.dialog-list__li').length,
-        bodyClasses: document.body.className,
-        bodyText: document.body.innerText.substring(0, 500),
-        allClassesStartingWithDialog: Array.from(new Set(
-          Array.from(document.querySelectorAll('[class*="dialog"]')).map(el => el.className)
-        )).slice(0, 20),
-        iframeCount: document.querySelectorAll('iframe').length,
-        iframeSrcs: Array.from(document.querySelectorAll('iframe')).map(f => (f as HTMLIFrameElement).src)
-      };
+    try {
+      // Ждём контейнер
+      await page.waitForSelector('#inbox-static-container', { timeout: 10000 });
+      console.log('✅ inbox-static-container найден');
+    } catch (e) {
+      console.log('⚠️ inbox-static-container не найден');
+    }
+    
+    // Даём время на выполнение baza.showAwesomeDialogBox и прочих скриптов
+    await page.waitForTimeout(5000);
+    
+    // Теперь ищем .dialog-list внутри статического контейнера
+    const hasDialogList = await page.evaluate(() => {
+      const container = document.querySelector('#inbox-static-container');
+      if (!container) return false;
+      return !!container.querySelector('.dialog-list');
     });
     
-    console.log('🔍 Анализ страницы:', JSON.stringify(debugInfo.page_analysis, null, 2));
+    console.log('🔍 Есть ли .dialog-list в контейнере:', hasDialogList);
     
-    // Если есть iframe - проверяем его содержимое
-    if (debugInfo.page_analysis.iframeCount > 0) {
-      console.log('🖼️ Обнаружены iframe, проверяем...');
+    if (!hasDialogList) {
+      // Если не нашли в статическом, ждём динамическую подгрузку
+      console.log('⏳ Статический контент не найден, ждём динамическую загрузку...');
       
-      const frames = page.frames();
-      console.log(`📦 Найдено фреймов: ${frames.length}`);
-      
-      for (let i = 0; i < frames.length; i++) {
-        const frame = frames[i];
-        console.log(`🔎 Фрейм ${i}: ${frame.url()}`);
+      for (let attempt = 0; attempt < 10; attempt++) {
+        await page.waitForTimeout(2000);
         
-        try {
-          const frameDialogsCount = await frame.evaluate(() => {
-            return document.querySelectorAll('.dialog-list__li').length;
-          });
-          
-          if (frameDialogsCount > 0) {
-            console.log(`✅ Диалоги найдены во фрейме ${i}: ${frameDialogsCount} шт`);
-            debugInfo.dialogs_in_frame = i;
-            
-            // Парсим из фрейма
-            const dialogs = await frame.evaluate(() => {
-              const chats: any[] = [];
-              
-              document.querySelectorAll('.dialog-list__li').forEach((li, idx) => {
-                const dialogBrief = li.querySelector('.dialog-brief');
-                const link = li.querySelector('.dialog-list__link') as HTMLAnchorElement;
-                
-                if (!dialogBrief || !link) return;
-                
-                const dialogId = dialogBrief.getAttribute('data-dialog-id');
-                const interlocutor = dialogBrief.getAttribute('data-interlocutor');
-                const latestMessage = dialogBrief.querySelector('.dialog-brief__latest_msg')?.textContent?.trim();
-                const userName = dialogBrief.querySelector('.dialog-brief__interlocutor')?.textContent?.trim();
-                const time = dialogBrief.querySelector('.bzr-dialog__message-dt')?.textContent?.trim();
-                const avatarStyle = dialogBrief.querySelector('.dialog-brief__image')?.getAttribute('style');
-                const avatarUrl = avatarStyle?.match(/url\((.*?)\)/)?.[1]?.replace(/['"]/g, '');
-                const chatUrl = link.href;
-                
-                chats.push({
-                  id: idx,
-                  dialogId: dialogId,
-                  interlocutor: interlocutor || userName,
-                  userName: userName,
-                  latestMessage: latestMessage,
-                  time: time,
-                  avatar: avatarUrl,
-                  chatUrl: chatUrl,
-                  unread: li.classList.contains('unread') || li.classList.contains('new')
-                });
-              });
-              
-              return chats;
-            });
-            
-            const screenshotBuffer = await page.screenshot({ fullPage: true });
-            screenshotBase64 = screenshotBuffer.toString('base64');
-            
-            await browser.close();
-            
-            console.log(`✅ Найдено диалогов во фрейме: ${dialogs.length}`);
-            
-            return res.json({ 
-              success: true,
-              currentUrl: page.url(),
-              count: dialogs.length,
-              dialogs,
-              screenshotBase64: screenshotBase64,
-              usedCache: fs.existsSync(getSessionPath(login)),
-              debug: debugInfo
-            });
-          }
-        } catch (e) {
-          console.log(`⚠️ Ошибка проверки фрейма ${i}:`, e);
+        const count = await page.evaluate(() => {
+          return document.querySelectorAll('.dialog-list__li').length;
+        });
+        
+        console.log(`🔄 Попытка ${attempt + 1}: найдено ${count} диалогов`);
+        
+        if (count > 0) {
+          console.log('✅ Диалоги появились!');
+          break;
         }
       }
     }
     
-    // Если во фреймах не нашли - пробуем в основной странице
-    console.log('⏳ Ждём загрузки в основной странице...');
+    // Дополнительная пауза
+    await page.waitForTimeout(3000);
     
-    // Пробуем разные стратегии ожидания
-    let loaded = false;
+    const currentUrl = page.url();
     
-    // Стратегия 1: waitForSelector с разными таймаутами
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      console.log(`🔄 Попытка ${attempt}/3 найти .dialog-list__li`);
-      try {
-        await page.waitForSelector('.dialog-list__li', { timeout: 10000, state: 'visible' });
-        loaded = true;
-        console.log('✅ Элементы найдены');
-        break;
-      } catch (e) {
-        console.log(`⚠️ Попытка ${attempt} не удалась`);
-        await page.waitForTimeout(3000);
-      }
-    }
-    
-    // Стратегия 2: Скроллинг (иногда диалоги подгружаются при скролле)
-    console.log('📜 Пробуем проскроллить страницу...');
-    await page.evaluate(() => {
-      window.scrollTo(0, 500);
-    });
-    await page.waitForTimeout(2000);
-    
-    await page.evaluate(() => {
-      window.scrollTo(0, 0);
-    });
-    await page.waitForTimeout(2000);
-    
-    // Финальный скриншот
+    // Скриншот
     const screenshotBuffer = await page.screenshot({ fullPage: true });
     screenshotBase64 = screenshotBuffer.toString('base64');
     
-    // Финальный парсинг
+    // Парсим диалоги (ищем везде)
     const dialogs = await page.evaluate(() => {
       const chats: any[] = [];
       
-      document.querySelectorAll('.dialog-list__li').forEach((li, idx) => {
+      // Ищем .dialog-list__li где угодно на странице
+      const dialogElements = document.querySelectorAll('.dialog-list__li');
+      
+      dialogElements.forEach((li, idx) => {
         const dialogBrief = li.querySelector('.dialog-brief');
         const link = li.querySelector('.dialog-list__link') as HTMLAnchorElement;
         
@@ -365,20 +281,13 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
       return chats;
     });
     
-    // Дополнительная диагностика если ничего не нашли
-    if (dialogs.length === 0) {
-      debugInfo.final_html_sample = await page.evaluate(() => {
-        return document.body.innerHTML.substring(0, 2000);
-      });
-    }
-    
     await browser.close();
     
     console.log(`✅ Найдено диалогов: ${dialogs.length}`);
     
     res.json({ 
       success: true,
-      currentUrl: page.url(),
+      currentUrl,
       count: dialogs.length,
       dialogs,
       screenshotBase64: screenshotBase64,
