@@ -133,7 +133,6 @@ async function loginToDrom(page: any, login: string, password: string, context: 
   }
 }
 
-// ИСПОЛЬЗУЕМ API НАПРЯМУЮ
 app.post('/drom/get-messages', async (req: Request, res: Response) => {
   const { login, password } = req.body;
   
@@ -164,7 +163,6 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
     
     await loginToDrom(page, login, password, context);
     
-    // Используем API эндпоинт напрямую
     console.log('💬 Запрашиваем список диалогов через API...');
     const apiUrl = 'https://my.drom.ru/personal/messaging/inbox-list?ajax=1&fromIndex=0&count=50&list=personal';
     
@@ -186,7 +184,6 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
       throw new Error('Некорректный формат ответа API');
     }
     
-    // Парсим диалоги из API
     const dialogs = data.briefs.map((brief: any, idx: number) => ({
       id: idx,
       dialogId: brief.dialogId,
@@ -302,4 +299,3 @@ app.listen(PORT, () => {
   console.log(`🚀 Drom automation service на порту ${PORT}`);
   console.log(`📍 Health: http://localhost:${PORT}/health`);
 });
-\
