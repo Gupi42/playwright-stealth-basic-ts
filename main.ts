@@ -51,9 +51,9 @@ app.get('/debug', (_req: Request, res: Response) => {
   const fileList = files.map(f => ({
     name: f,
     url: `/debug/${f}`,
-    path: path.join(DEBUG_DIR, f)
+    size: fs.statSync(path.join(DEBUG_DIR, f)).size
   }));
-  res.json({ files: fileList });
+  res.json({ files: fileList, count: files.length });
 });
 
 async function loginToDrom(
@@ -161,14 +161,13 @@ async function loginToDrom(
     console.log('🔍 Анализ страницы:', {
       url: pageAnalysis.url,
       needsVerification: pageAnalysis.needsVerification,
-      telegramElementsCount: pageAnalysis.telegramElements.length,
-      codeElementsCount: pageAnalysis.codeElements.length
+      telegramElementsCount: pageAnalysis.telegramElements.length
     });
     
     if (pageAnalysis.needsVerification) {
       console.log('📱 Требуется подтверждение устройства');
       
-      // Сохраняем скриншот и HTML
+      // Сохраняем скриншот и HTML ДО клика
       const timestamp = Date.now();
       const screenshotFilename = `verification_${timestamp}.png`;
       const htmlFilename = `verification_${timestamp}.html`;
@@ -179,10 +178,10 @@ async function loginToDrom(
       const html = await page.content();
       fs.writeFileSync(htmlPath, html, 'utf8');
       
-      console.log('📸 Скриншот сохранён:', screenshotPath);
-      console.log('📄 HTML сохранён:', htmlPath);
+      console.log('📸 Скриншот ДО клика сохранён:', screenshotPath);
+      console.log('📄 HTML ДО клика сохранён:', htmlPath);
       
-      const debugInfo = {
+      const debugInfo: any = {
         screenshotUrl: `/debug/${screenshotFilename}`,
         htmlUrl: `/debug/${htmlFilename}`,
         screenshotPath: screenshotPath,
@@ -193,7 +192,7 @@ async function loginToDrom(
       };
       
       if (!verificationCode) {
-        // ИСПРАВЛЕНО: Кликаем по элементу <a> с классом telegram-send-phone-btn
+        // Кликаем по элементу <a> с классом telegram-send-phone-btn
         let clicked = false;
         
         console.log('📲 Найдено элементов с "Telegram":', pageAnalysis.telegramElements.length);
@@ -270,17 +269,56 @@ async function loginToDrom(
           }
         }
         
-        if (!clicked) {
-          console.log('❌ Не удалось автоматически нажать элемент Telegram');
+        // ✅ ДОБАВЛЕНО: Скриншот ПОСЛЕ клика по кнопке Telegram
+        if (clicked) {
+          console.log('✅ Элемент Telegram нажат! Делаем скриншот после клика...');
+          
+          const afterClickFilename = `after_telegram_click_${timestamp}.png`;
+          const afterClickHtmlFilename = `after_telegram_click_${timestamp}.html`;
+          const afterClickPath = path.join(DEBUG_DIR, afterClickFilename);
+          const afterClickHtmlPath = path.join(DEBUG_DIR, afterClickHtmlFilename);
+          
+          await page.screenshot({ path: afterClickPath, fullPage: true });
+          const afterClickHtml = await page.content();
+          fs.writeFileSync(afterClickHtmlPath, afterClickHtml, 'utf8');
+          
+          console.log('📸 Скриншот ПОСЛЕ клика сохранён:', afterClickPath);
+          console.log('📄 HTML ПОСЛЕ клика сохранён:', afterClickHtmlPath);
+          
+          // Добавляем в debugInfo
+          debugInfo.afterClickScreenshotUrl = `/debug/${afterClickFilename}`;
+          debugInfo.afterClickHtmlUrl = `/debug/${afterClickHtmlFilename}`;
+          debugInfo.afterClickScreenshotPath = afterClickPath;
+          debugInfo.afterClickHtmlPath = afterClickHtmlPath;
+          
+          // Анализируем страницу после клика
+          const afterClickAnalysis = await page.evaluate(() => {
+            const bodyText = document.body.innerText;
+            return {
+              url: window.location.href,
+              bodyPreview: bodyText.substring(0, 1000),
+              hasCodeInput: !!document.querySelector('input[type="text"], input[type="tel"], input[type="number"]'),
+              hasTelegramMessage: bodyText.includes('Telegram') || bodyText.includes('код'),
+              hasErrorMessage: bodyText.toLowerCase().includes('ошибка') || 
+                              bodyText.toLowerCase().includes('неверный'),
+              hasSuccessMessage: bodyText.toLowerCase().includes('отправлен') ||
+                                bodyText.toLowerCase().includes('проверьте')
+            };
+          });
+          
+          console.log('🔍 Анализ после клика:', afterClickAnalysis);
+          debugInfo.afterClickAnalysis = afterClickAnalysis;
+          
+          console.log('✅ Проверьте Telegram и скриншот после клика');
         } else {
-          console.log('✅ Элемент Telegram нажат! Код должен прийти в Telegram');
+          console.log('❌ Не удалось автоматически нажать элемент Telegram');
         }
         
         return { 
           success: false, 
           needsVerification: true,
           message: clicked ? 
-            'Код отправлен в Telegram! Введите его в поле verificationCode' :
+            'Код отправлен в Telegram! Проверьте бота и введите код в поле verificationCode. Проверьте afterClickScreenshotUrl для подтверждения.' :
             'Не удалось нажать кнопку Telegram. Проверьте debug файлы.',
           debug: debugInfo
         };
@@ -289,10 +327,8 @@ async function loginToDrom(
       // Вводим код подтверждения
       console.log('🔢 Вводим код подтверждения:', verificationCode);
       
-      // Ждём загрузки страницы с полем ввода
       await page.waitForTimeout(2000);
       
-      // Ищем поле ввода кода
       const inputFilled = await page.evaluate((code: string) => {
         const inputs = Array.from(document.querySelectorAll('input'));
         const codeInput = inputs.find(inp => 
@@ -313,7 +349,6 @@ async function loginToDrom(
         console.log('✅ Код введён');
         await page.waitForTimeout(1000);
         
-        // Ищем и нажимаем кнопку подтверждения
         const submitClicked = await page.evaluate(() => {
           const buttons = Array.from(document.querySelectorAll('button, [type="submit"], a'));
           const submitBtn = buttons.find(btn => {
