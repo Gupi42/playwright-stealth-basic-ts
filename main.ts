@@ -1,15 +1,14 @@
-import express from 'express';
+import express, { Request, Response } from 'express';
 import { chromium } from 'playwright-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 
-// Добавляем stealth-плагин
 chromium.use(StealthPlugin());
 
 const app = express();
 app.use(express.json());
 
-// Health check эндпоинт
-app.get('/health', (req, res) => {
+// Health check
+app.get('/health', (_req: Request, res: Response) => {
   res.json({ 
     status: 'ok', 
     service: 'drom-automation',
@@ -17,8 +16,8 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Получение сообщений с Дром
-app.post('/drom/get-messages', async (req, res) => {
+// Получение сообщений
+app.post('/drom/get-messages', async (req: Request, res: Response) => {
   const { login, password } = req.body;
   
   if (!login || !password) {
@@ -45,37 +44,33 @@ app.post('/drom/get-messages', async (req, res) => {
 
     const page = await context.newPage();
     
-    // Авторизация на Дром
     console.log('📍 Переход на Дром...');
     await page.goto('https://www.drom.ru/', { waitUntil: 'networkidle' });
     
-    // Ищем кнопку входа (селектор нужно уточнить через DevTools!)
+    // Поиск кнопки входа
     const loginBtn = page.locator('text=Войти').first();
     if (await loginBtn.count() > 0) {
       await loginBtn.click();
       await page.waitForTimeout(2000);
     }
     
-    // Вводим данные (селекторы примерные, нужно проверить!)
     console.log('🔐 Авторизация...');
     await page.fill('input[name="login"], input[type="email"]', login);
     await page.fill('input[name="password"], input[type="password"]', password);
     await page.click('button[type="submit"]');
     await page.waitForLoadState('networkidle');
     
-    // Переход в сообщения
     console.log('💬 Открываем чаты...');
     await page.goto('https://www.drom.ru/my/messages/', { waitUntil: 'networkidle' });
     await page.waitForTimeout(3000);
     
-    // Делаем скриншот для отладки
-    const screenshot = await page.screenshot({ encoding: 'base64' });
+    // Скриншот в base64
+    const screenshotBuffer = await page.screenshot();
+    const screenshotBase64 = screenshotBuffer.toString('base64');
     
-    // Парсинг сообщений (ВАЖНО: селекторы нужно уточнить!)
+    // Парсинг сообщений
     const messages = await page.evaluate(() => {
       const chats: any[] = [];
-      
-      // Ищем любые элементы, похожие на чаты
       const selectors = [
         '[class*="chat"]',
         '[class*="message"]',
@@ -97,7 +92,7 @@ app.post('/drom/get-messages', async (req, res) => {
         });
       });
       
-      return chats.slice(0, 20); // Первые 20 для отладки
+      return chats.slice(0, 20);
     });
     
     await browser.close();
@@ -108,7 +103,7 @@ app.post('/drom/get-messages', async (req, res) => {
       success: true, 
       count: messages.length,
       messages,
-      screenshot: screenshot.substring(0, 100) + '...' // Первые 100 символов
+      screenshotPreview: screenshotBase64.substring(0, 100) + '...'
     });
     
   } catch (error: any) {
@@ -122,7 +117,7 @@ app.post('/drom/get-messages', async (req, res) => {
 });
 
 // Отправка сообщения
-app.post('/drom/send-message', async (req, res) => {
+app.post('/drom/send-message', async (req: Request, res: Response) => {
   const { login, password, chatUrl, text } = req.body;
   
   if (!login || !password || !chatUrl || !text) {
@@ -144,7 +139,6 @@ app.post('/drom/send-message', async (req, res) => {
 
     const page = await context.newPage();
     
-    // Авторизация (копируем логику выше)
     await page.goto('https://www.drom.ru/');
     const loginBtn = page.locator('text=Войти').first();
     if (await loginBtn.count() > 0) {
@@ -157,13 +151,11 @@ app.post('/drom/send-message', async (req, res) => {
     await page.click('button[type="submit"]');
     await page.waitForLoadState('networkidle');
     
-    // Открываем конкретный чат
     await page.goto(chatUrl);
     await page.waitForTimeout(2000);
     
-    // Ввод текста (селектор уточнить!)
     await page.fill('textarea, input[type="text"]', text);
-    await page.keyboard.press('Enter'); // или click на кнопку
+    await page.keyboard.press('Enter');
     await page.waitForTimeout(2000);
     
     await browser.close();
@@ -177,9 +169,7 @@ app.post('/drom/send-message', async (req, res) => {
   }
 });
 
-// Запуск сервера
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 Drom automation service запущен на порту ${PORT}`);
-  console.log(`📍 Health check: http://localhost:${PORT}/health`);
+  console.log(`🚀 Drom automation service на порту ${PORT}`);
 });
