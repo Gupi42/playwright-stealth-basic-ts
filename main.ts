@@ -33,6 +33,29 @@ app.get('/health', (_req: Request, res: Response) => {
   });
 });
 
+// Эндпоинт для скачивания debug файлов
+app.get('/debug/:filename', (req: Request, res: Response) => {
+  const filename = req.params.filename;
+  const filepath = path.join(DEBUG_DIR, filename);
+  
+  if (fs.existsSync(filepath)) {
+    res.sendFile(filepath);
+  } else {
+    res.status(404).json({ error: 'File not found' });
+  }
+});
+
+// Список debug файлов
+app.get('/debug', (_req: Request, res: Response) => {
+  const files = fs.readdirSync(DEBUG_DIR);
+  const fileList = files.map(f => ({
+    name: f,
+    url: `/debug/${f}`,
+    path: path.join(DEBUG_DIR, f)
+  }));
+  res.json({ files: fileList });
+});
+
 async function loginToDrom(
   page: any, 
   login: string, 
@@ -147,8 +170,10 @@ async function loginToDrom(
       
       // Сохраняем скриншот и HTML
       const timestamp = Date.now();
-      const screenshotPath = path.join(DEBUG_DIR, `verification_${timestamp}.png`);
-      const htmlPath = path.join(DEBUG_DIR, `verification_${timestamp}.html`);
+      const screenshotFilename = `verification_${timestamp}.png`;
+      const htmlFilename = `verification_${timestamp}.html`;
+      const screenshotPath = path.join(DEBUG_DIR, screenshotFilename);
+      const htmlPath = path.join(DEBUG_DIR, htmlFilename);
       
       await page.screenshot({ path: screenshotPath, fullPage: true });
       const html = await page.content();
@@ -158,148 +183,165 @@ async function loginToDrom(
       console.log('📄 HTML сохранён:', htmlPath);
       
       const debugInfo = {
-        screenshot: screenshotPath,
-        html: htmlPath,
+        screenshotUrl: `/debug/${screenshotFilename}`,
+        htmlUrl: `/debug/${htmlFilename}`,
+        screenshotPath: screenshotPath,
+        htmlPath: htmlPath,
         telegramElements: pageAnalysis.telegramElements,
-        allClickableElements: pageAnalysis.clickableElements.slice(0, 20), // первые 20
+        allClickableElements: pageAnalysis.clickableElements.slice(0, 20),
         bodyPreview: pageAnalysis.bodyText
       };
       
       if (!verificationCode) {
-        // Пробуем нажать кнопку Telegram
+        // ИСПРАВЛЕНО: Кликаем по элементу <a> с классом telegram-send-phone-btn
         let clicked = false;
         
-        // Способ 1: Ищем через evaluate и кликаем
-        if (pageAnalysis.telegramElements.length > 0) {
-          console.log('📲 Найдено элементов с "Telegram":', pageAnalysis.telegramElements.length);
-          console.log('Элементы:', pageAnalysis.telegramElements);
+        console.log('📲 Найдено элементов с "Telegram":', pageAnalysis.telegramElements.length);
+        console.log('Элементы:', pageAnalysis.telegramElements);
+        
+        // Способ 1: Клик по классу telegram-send-phone-btn
+        try {
+          clicked = await page.evaluate(() => {
+            const telegramBtn = document.querySelector('.telegram-send-phone-btn');
+            if (telegramBtn && telegramBtn instanceof HTMLElement) {
+              console.log('Кликаем по .telegram-send-phone-btn');
+              telegramBtn.click();
+              return true;
+            }
+            return false;
+          });
           
+          if (clicked) {
+            console.log('✅ Нажат элемент .telegram-send-phone-btn через evaluate');
+            await page.waitForTimeout(3000);
+          }
+        } catch (e: any) {
+          console.log('⚠️ Ошибка клика через класс:', e.message);
+        }
+        
+        // Способ 2: Playwright клик по ссылке
+        if (!clicked) {
+          try {
+            await page.click('a.telegram-send-phone-btn', { timeout: 3000 });
+            console.log('✅ Нажат через Playwright a.telegram-send-phone-btn');
+            clicked = true;
+            await page.waitForTimeout(3000);
+          } catch (e) {
+            console.log('⚠️ Не удалось нажать через Playwright селектор');
+          }
+        }
+        
+        // Способ 3: Клик по тексту
+        if (!clicked) {
+          try {
+            await page.click('text=Проверить через Telegram', { timeout: 3000 });
+            console.log('✅ Нажат через text=Проверить через Telegram');
+            clicked = true;
+            await page.waitForTimeout(3000);
+          } catch (e) {
+            console.log('⚠️ Не удалось нажать через текст');
+          }
+        }
+        
+        // Способ 4: Универсальный поиск <a> с Telegram
+        if (!clicked) {
           try {
             clicked = await page.evaluate(() => {
-              const allElements = Array.from(document.querySelectorAll('*'));
-              const telegramEl = allElements.find(el => {
-                const text = (el.textContent || '').toLowerCase();
-                const visible = (el as HTMLElement).offsetParent !== null;
-                return visible && (
-                  text.includes('проверить через telegram') ||
-                  text.includes('telegram') && text.length < 100
-                );
-              });
+              const links = Array.from(document.querySelectorAll('a'));
+              const telegramLink = links.find(a => 
+                a.textContent?.includes('Telegram') && 
+                a.offsetParent !== null
+              );
               
-              if (telegramEl && telegramEl instanceof HTMLElement) {
-                console.log('Кликаем элемент:', telegramEl.tagName, telegramEl.textContent?.substring(0, 50));
-                telegramEl.click();
+              if (telegramLink) {
+                console.log('Кликаем по ссылке:', telegramLink.textContent);
+                telegramLink.click();
                 return true;
               }
               return false;
             });
             
             if (clicked) {
-              console.log('✅ Элемент Telegram нажат через evaluate');
-              await page.waitForTimeout(2000);
+              console.log('✅ Нажата ссылка с Telegram через универсальный поиск');
+              await page.waitForTimeout(3000);
             }
-          } catch (e: any) {
-            console.log('⚠️ Ошибка клика через evaluate:', e.message);
-          }
-        }
-        
-        // Способ 2: Playwright селектор
-        if (!clicked) {
-          try {
-            await page.click('text=Telegram', { timeout: 3000 });
-            console.log('✅ Нажат через Playwright text=Telegram');
-            clicked = true;
-            await page.waitForTimeout(2000);
           } catch (e) {
-            console.log('⚠️ Не удалось нажать через text=Telegram');
-          }
-        }
-        
-        // Способ 3: Пробуем по частичному совпадению
-        if (!clicked && pageAnalysis.telegramElements.length > 0) {
-          const firstTelegram = pageAnalysis.telegramElements[0];
-          try {
-            await page.click(`${firstTelegram.tag}:has-text("${firstTelegram.text.substring(0, 20)}")`, { timeout: 3000 });
-            console.log('✅ Нажат через селектор:', firstTelegram.tag);
-            clicked = true;
-            await page.waitForTimeout(2000);
-          } catch (e) {
-            console.log('⚠️ Не удалось нажать через селектор');
+            console.log('⚠️ Универсальный поиск не сработал');
           }
         }
         
         if (!clicked) {
-          console.log('❌ Не удалось автоматически нажать кнопку Telegram');
-          console.log('📋 Проверьте debug файлы для анализа');
+          console.log('❌ Не удалось автоматически нажать элемент Telegram');
+        } else {
+          console.log('✅ Элемент Telegram нажат! Код должен прийти в Telegram');
         }
         
         return { 
           success: false, 
           needsVerification: true,
-          message: 'Требуется код подтверждения из Telegram. Проверьте debug файлы.',
+          message: clicked ? 
+            'Код отправлен в Telegram! Введите его в поле verificationCode' :
+            'Не удалось нажать кнопку Telegram. Проверьте debug файлы.',
           debug: debugInfo
         };
       }
       
       // Вводим код подтверждения
-      console.log('🔢 Вводим код подтверждения...');
+      console.log('🔢 Вводим код подтверждения:', verificationCode);
       
-      // Ищем поле ввода
-      const inputFields = await page.evaluate(() => {
+      // Ждём загрузки страницы с полем ввода
+      await page.waitForTimeout(2000);
+      
+      // Ищем поле ввода кода
+      const inputFilled = await page.evaluate((code: string) => {
         const inputs = Array.from(document.querySelectorAll('input'));
-        return inputs.map(input => ({
-          type: input.type,
-          name: input.name,
-          placeholder: input.placeholder,
-          visible: input.offsetParent !== null,
-          id: input.id
-        })).filter(inp => inp.visible);
-      });
-      
-      console.log('📝 Найдено полей ввода:', inputFields);
-      
-      // Пробуем ввести код в первое видимое текстовое поле
-      try {
-        const codeInput = await page.evaluate(() => {
-          const inputs = Array.from(document.querySelectorAll('input'));
-          return inputs.find(inp => 
-            inp.offsetParent !== null && 
-            (inp.type === 'text' || inp.type === 'tel' || inp.type === 'number')
-          );
-        });
+        const codeInput = inputs.find(inp => 
+          inp.offsetParent !== null && 
+          (inp.type === 'text' || inp.type === 'tel' || inp.type === 'number')
+        );
         
         if (codeInput) {
-          await page.fill('input[type="text"], input[type="tel"], input[type="number"]', verificationCode);
-          console.log('✅ Код введён');
-          await page.waitForTimeout(1000);
-          
-          // Ищем кнопку подтверждения
-          const submitClicked = await page.evaluate(() => {
-            const buttons = Array.from(document.querySelectorAll('button, [type="submit"]'));
-            const submitBtn = buttons.find(btn => {
-              const text = (btn.textContent || '').toLowerCase();
-              return text.includes('подтвердить') || 
-                     text.includes('войти') || 
-                     btn.getAttribute('type') === 'submit';
-            });
-            
-            if (submitBtn && submitBtn instanceof HTMLElement) {
-              submitBtn.click();
-              return true;
-            }
-            return false;
+          codeInput.value = code;
+          codeInput.dispatchEvent(new Event('input', { bubbles: true }));
+          codeInput.dispatchEvent(new Event('change', { bubbles: true }));
+          return true;
+        }
+        return false;
+      }, verificationCode);
+      
+      if (inputFilled) {
+        console.log('✅ Код введён');
+        await page.waitForTimeout(1000);
+        
+        // Ищем и нажимаем кнопку подтверждения
+        const submitClicked = await page.evaluate(() => {
+          const buttons = Array.from(document.querySelectorAll('button, [type="submit"], a'));
+          const submitBtn = buttons.find(btn => {
+            const text = (btn.textContent || '').toLowerCase();
+            const visible = (btn as HTMLElement).offsetParent !== null;
+            return visible && (
+              text.includes('подтвердить') || 
+              text.includes('войти') ||
+              btn.getAttribute('type') === 'submit'
+            );
           });
           
-          if (submitClicked) {
-            console.log('✅ Кнопка подтверждения нажата');
-            await page.waitForTimeout(3000);
-          } else {
-            console.log('⚠️ Кнопка подтверждения не найдена, возможно код проверяется автоматически');
-            await page.waitForTimeout(2000);
+          if (submitBtn && submitBtn instanceof HTMLElement) {
+            submitBtn.click();
+            return true;
           }
+          return false;
+        });
+        
+        if (submitClicked) {
+          console.log('✅ Кнопка подтверждения нажата');
+          await page.waitForTimeout(3000);
+        } else {
+          console.log('⚠️ Кнопка не найдена, возможно автопроверка');
+          await page.waitForTimeout(2000);
         }
-      } catch (e: any) {
-        console.log('⚠️ Ошибка ввода кода:', e.message);
+      } else {
+        console.log('❌ Не удалось найти поле ввода кода');
       }
     }
     
@@ -557,5 +599,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Drom automation service на порту ${PORT}`);
   console.log(`📍 Health: http://localhost:${PORT}/health`);
-  console.log(`📍 Debug folder: ${DEBUG_DIR}`);
+  console.log(`📍 Debug files: http://localhost:${PORT}/debug`);
 });
