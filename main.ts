@@ -87,7 +87,7 @@ async function loginToDrom(page: any, login: string, password: string) {
 
 
 // Получение сообщений
-app.post('/drom/get-messages', async (req: Request, res: Response) => {
+app.post('https://my.drom.ru/personal/messaging-modal?switchPosition=dialogs', async (req: Request, res: Response) => {
   const { login, password } = req.body;
   
   if (!login || !password) {
