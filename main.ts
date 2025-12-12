@@ -40,7 +40,7 @@ async function loginToDrom(page: any, login: string, password: string, context: 
       if (sessionAge < 24 * 60 * 60 * 1000) {
         await context.addCookies(sessionData.cookies);
         
-        await page.goto('https://my.drom.ru/personal/messaging-modal?switchPosition=dialogs', { 
+        await page.goto('https://my.drom.ru/personal/', { 
           waitUntil: 'domcontentloaded', 
           timeout: 15000 
         });
@@ -133,7 +133,7 @@ async function loginToDrom(page: any, login: string, password: string, context: 
   }
 }
 
-// НОВЫЙ ПОДХОД: Перехватываем API запросы
+// ИСПОЛЬЗУЕМ API НАПРЯМУЮ
 app.post('/drom/get-messages', async (req: Request, res: Response) => {
   const { login, password } = req.body;
   
@@ -142,9 +142,6 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
   }
   
   console.log('🔍 Получаем сообщения с Дром для:', login.substring(0, 3) + '***');
-  
-  let screenshotBase64 = '';
-  let apiDialogs: any = null;
   
   try {
     const browser = await chromium.launch({
@@ -165,109 +162,57 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
 
     const page = await context.newPage();
     
-    // Перехватываем все network requests
-    page.on('response', async (response: any) => {
-      const url = response.url();
-      
-      // Ищем API запросы с диалогами
-      if (url.includes('/api/') || url.includes('dialog') || url.includes('message')) {
-        console.log('🌐 API запрос:', url);
-        
-        try {
-          const contentType = response.headers()['content-type'] || '';
-          if (contentType.includes('application/json')) {
-            const json = await response.json();
-            console.log('📦 JSON ответ:', JSON.stringify(json).substring(0, 500));
-            
-            // Если это диалоги - сохраняем
-            if (json && (json.dialogs || json.data || Array.isArray(json))) {
-              apiDialogs = json;
-              console.log('✅ Найдены данные диалогов через API!');
-            }
-          }
-        } catch (e) {
-          // Не JSON или ошибка парсинга
-        }
-      }
-    });
-    
     await loginToDrom(page, login, password, context);
     
-    console.log('💬 Открываем чаты...');
-    await page.goto('https://my.drom.ru/personal/messaging-modal?switchPosition=dialogs', { 
+    // Используем API эндпоинт напрямую
+    console.log('💬 Запрашиваем список диалогов через API...');
+    const apiUrl = 'https://my.drom.ru/personal/messaging/inbox-list?ajax=1&fromIndex=0&count=50&list=personal';
+    
+    const response = await page.goto(apiUrl, { 
       waitUntil: 'networkidle',
       timeout: 30000 
     });
     
-    console.log('📍 URL:', page.url());
+    const jsonText = await response?.text();
+    console.log('📦 API ответ получен, длина:', jsonText?.length);
     
-    // Ждём все запросы
-    await page.waitForTimeout(10000);
-    
-    const screenshotBuffer = await page.screenshot({ fullPage: true });
-    screenshotBase64 = screenshotBuffer.toString('base64');
-    
-    // Если перехватили API - используем его
-    if (apiDialogs) {
-      console.log('✅ Используем данные из API');
-      await browser.close();
-      
-      return res.json({
-        success: true,
-        source: 'api',
-        currentUrl: page.url(),
-        apiData: apiDialogs,
-        screenshotBase64: screenshotBase64
-      });
+    if (!jsonText) {
+      throw new Error('Пустой ответ от API');
     }
     
-    // Если не перехватили - парсим DOM (старый способ)
-    console.log('⚠️ API данных нет, парсим DOM...');
+    const data = JSON.parse(jsonText);
     
-    const dialogs: any = await page.evaluate(() => {
-      const chats = [] as any[];
-      const dialogElements = document.querySelectorAll('.dialog-list__li');
-      
-      dialogElements.forEach((li, idx) => {
-        const dialogBrief = li.querySelector('.dialog-brief');
-        const linkElement = li.querySelector('.dialog-list__link');
-        
-        if (!dialogBrief || !linkElement) return;
-        
-        const dialogId = dialogBrief.getAttribute('data-dialog-id');
-        const interlocutor = dialogBrief.getAttribute('data-interlocutor');
-        const latestMessage = dialogBrief.querySelector('.dialog-brief__latest_msg')?.textContent?.trim();
-        const userName = dialogBrief.querySelector('.dialog-brief__interlocutor')?.textContent?.trim();
-        const time = dialogBrief.querySelector('.bzr-dialog__message-dt')?.textContent?.trim();
-        const avatarStyle = dialogBrief.querySelector('.dialog-brief__image')?.getAttribute('style');
-        const avatarUrl = avatarStyle?.match(/url\((.*?)\)/)?.[1]?.replace(/['"]/g, '');
-        
-        chats.push({
-          id: idx,
-          dialogId: dialogId,
-          interlocutor: interlocutor || userName,
-          userName: userName,
-          latestMessage: latestMessage,
-          time: time,
-          avatar: avatarUrl,
-          chatUrl: (linkElement as HTMLAnchorElement).href,
-          unread: li.classList.contains('unread') || li.classList.contains('new')
-        });
-      });
-      
-      return chats;
-    });
+    if (!data.briefs || !Array.isArray(data.briefs)) {
+      throw new Error('Некорректный формат ответа API');
+    }
+    
+    // Парсим диалоги из API
+    const dialogs = data.briefs.map((brief: any, idx: number) => ({
+      id: idx,
+      dialogId: brief.dialogId,
+      interlocutor: brief.interlocutor,
+      userName: brief.interlocutor,
+      latestMessage: brief.html?.match(/dialog-brief__latest_msg[^>]*>([^<]+)</)?.[1] || '',
+      time: brief.html?.match(/bzr-dialog__message-dt[^>]*>([^<]+)</)?.[1] || '',
+      avatar: brief.html?.match(/background-image:\s*url\(([^)]+)\)/)?.[1] || '',
+      chatUrl: `https://my.drom.ru${brief.url}`,
+      fullUrl: `https://my.drom.ru/personal/messaging/view?dialogId=${brief.dialogId}`,
+      isUnread: brief.isUnread,
+      lastMessageDate: brief.lastMessageDate,
+      canRemove: brief.canRemoveDialog
+    }));
     
     await browser.close();
     
+    console.log(`✅ Найдено диалогов: ${dialogs.length}`);
+    
     res.json({ 
       success: true,
-      source: 'dom',
-      currentUrl: page.url(),
-      count: Array.isArray(dialogs) ? dialogs.length : 0,
-      dialogs: dialogs || [],
-      screenshotBase64: screenshotBase64,
-      usedCache: fs.existsSync(getSessionPath(login))
+      source: 'api',
+      count: dialogs.length,
+      dialogs: dialogs,
+      usedCache: fs.existsSync(getSessionPath(login)),
+      rawApiData: data
     });
     
   } catch (error: any) {
@@ -275,8 +220,7 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
     res.status(500).json({ 
       success: false,
       error: error.message, 
-      stack: error.stack,
-      screenshotBase64: screenshotBase64 || 'not_captured'
+      stack: error.stack
     });
   }
 });
@@ -309,19 +253,19 @@ app.post('/drom/send-message', async (req: Request, res: Response) => {
     
     await loginToDrom(page, login, password, context);
     
-    const chatUrl = `https://www.drom.ru/personal/messaging/view?dialogId=${dialogId}`;
+    const chatUrl = `https://my.drom.ru/personal/messaging/view?dialogId=${dialogId}`;
     console.log('📍 Открываем чат:', chatUrl);
     
     await page.goto(chatUrl, { waitUntil: 'networkidle' });
     await page.waitForTimeout(3000);
     
-    await page.waitForSelector('textarea[name="message"], textarea', { timeout: 10000 });
+    await page.waitForSelector('textarea[name="message"]', { timeout: 10000 });
     
     console.log('✍️ Вводим текст...');
-    await page.fill('textarea[name="message"], textarea', text);
+    await page.fill('textarea[name="message"]', text);
     await page.waitForTimeout(500);
     
-    const sendButton = page.locator('button[type="submit"], button:has-text("Отправить")').first();
+    const sendButton = page.locator('button[name="post"][value="Отправить"]').first();
     if (await sendButton.count() > 0) {
       await sendButton.click();
       console.log('✅ Кнопка отправки нажата');
@@ -358,3 +302,4 @@ app.listen(PORT, () => {
   console.log(`🚀 Drom automation service на порту ${PORT}`);
   console.log(`📍 Health: http://localhost:${PORT}/health`);
 });
+\
