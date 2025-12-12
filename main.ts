@@ -11,18 +11,15 @@ app.use(express.json());
 
 const SESSIONS_DIR = path.join(__dirname, 'sessions');
 
-// Создаём папку для сессий
 if (!fs.existsSync(SESSIONS_DIR)) {
   fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 }
 
-// Функция для получения пути к файлу сессии
 function getSessionPath(login: string): string {
   const sanitized = login.replace(/[^a-zA-Z0-9]/g, '_');
   return path.join(SESSIONS_DIR, `session_${sanitized}.json`);
 }
 
-// Health check
 app.get('/health', (_req: Request, res: Response) => {
   res.json({ 
     status: 'ok', 
@@ -31,7 +28,6 @@ app.get('/health', (_req: Request, res: Response) => {
   });
 });
 
-// Функция авторизации с сохранением сессии
 async function loginToDrom(page: any, login: string, password: string, context: any) {
   const sessionPath = getSessionPath(login);
   
@@ -137,7 +133,6 @@ async function loginToDrom(page: any, login: string, password: string, context: 
   }
 }
 
-// Получение сообщений
 app.post('/drom/get-messages', async (req: Request, res: Response) => {
   const { login, password } = req.body;
   
@@ -152,7 +147,7 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
   
   try {
     const browser = await chromium.launch({
-      headless: true, // Вернул true для Railway
+      headless: true,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -181,10 +176,10 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
     
     await page.waitForTimeout(3000);
     
-    console.log('⏳ Ждём появления диалогов через MutationObserver...');
+    console.log('⏳ Ждём появления диалогов...');
     
-    // ИСПРАВЛЕНО: убрал TypeScript-синтаксис из evaluate
-    const dialogs = await page.evaluate(() => {
+    // Вынес evaluate в отдельную функцию для типизации
+    const dialogs: any = await page.evaluate(() => {
       return new Promise((resolve) => {
         let attempts = 0;
         const maxAttempts = 30;
@@ -195,13 +190,13 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
           if (dialogElements.length > 0) {
             console.log('Диалоги найдены!', dialogElements.length);
             
-            const chats = [];
+            const chats = [] as any[];
             
             dialogElements.forEach((li, idx) => {
               const dialogBrief = li.querySelector('.dialog-brief');
-              const link = li.querySelector('.dialog-list__link');
+              const linkElement = li.querySelector('.dialog-list__link');
               
-              if (!dialogBrief || !link) return;
+              if (!dialogBrief || !linkElement) return;
               
               const dialogId = dialogBrief.getAttribute('data-dialog-id');
               const interlocutor = dialogBrief.getAttribute('data-interlocutor');
@@ -210,7 +205,6 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
               const time = dialogBrief.querySelector('.bzr-dialog__message-dt')?.textContent?.trim();
               const avatarStyle = dialogBrief.querySelector('.dialog-brief__image')?.getAttribute('style');
               const avatarUrl = avatarStyle?.match(/url\((.*?)\)/)?.[1]?.replace(/['"]/g, '');
-              const chatUrl = link.href;
               
               chats.push({
                 id: idx,
@@ -220,7 +214,7 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
                 latestMessage: latestMessage,
                 time: time,
                 avatar: avatarUrl,
-                chatUrl: chatUrl,
+                chatUrl: (linkElement as HTMLAnchorElement).href,
                 unread: li.classList.contains('unread') || li.classList.contains('new')
               });
             });
@@ -232,7 +226,7 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
           attempts++;
           
           if (attempts >= maxAttempts) {
-            console.log('Превышено время ожидания, диалоги не найдены');
+            console.log('Превышено время ожидания');
             resolve([]);
             return;
           }
@@ -266,7 +260,7 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
       debugInfo.html_body = await page.evaluate(() => document.body.innerHTML.substring(0, 3000));
       debugInfo.all_classes = await page.evaluate(() => {
         const elements = document.querySelectorAll('[class*="dialog"]');
-        const result = [];
+        const result = [] as any[];
         for (let i = 0; i < Math.min(elements.length, 10); i++) {
           const el = elements[i];
           result.push({
@@ -303,7 +297,6 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
   }
 });
 
-// Отправка сообщения
 app.post('/drom/send-message', async (req: Request, res: Response) => {
   const { login, password, dialogId, text } = req.body;
   
