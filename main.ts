@@ -33,7 +33,6 @@ app.get('/health', (_req: Request, res: Response) => {
   });
 });
 
-// Эндпоинт для скачивания debug файлов
 app.get('/debug/:filename', (req: Request, res: Response) => {
   const filename = req.params.filename;
   const filepath = path.join(DEBUG_DIR, filename);
@@ -45,7 +44,6 @@ app.get('/debug/:filename', (req: Request, res: Response) => {
   }
 });
 
-// Список debug файлов
 app.get('/debug', (_req: Request, res: Response) => {
   const files = fs.readdirSync(DEBUG_DIR);
   const fileList = files.map(f => ({
@@ -62,17 +60,16 @@ async function loginToDrom(
   password: string, 
   context: any, 
   verificationCode?: string
-): Promise<{ success: boolean; needsVerification: boolean; message?: string; debug?: any }> {
+): Promise<{ success: boolean; needsVerification: boolean; message?: string; debug?: any; warning?: string }> {
   const sessionPath = getSessionPath(login);
   
-  // Проверяем сохранённую сессию
   if (fs.existsSync(sessionPath)) {
     console.log('🔄 Загружаем сохранённую сессию...');
     try {
       const sessionData = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
       const sessionAge = Date.now() - sessionData.timestamp;
       
-      if (sessionAge < 30 * 24 * 60 * 60 * 1000) { // 30 дней
+      if (sessionAge < 30 * 24 * 60 * 60 * 1000) {
         await context.addCookies(sessionData.cookies);
         
         await page.goto('https://my.drom.ru/personal/', { 
@@ -125,7 +122,6 @@ async function loginToDrom(
     const currentUrl = page.url();
     console.log('📍 URL после входа:', currentUrl);
     
-    // Детальная проверка страницы
     const pageAnalysis = await page.evaluate(() => {
       const bodyText = document.body.innerText;
       const allClickableElements: any[] = [];
@@ -173,7 +169,6 @@ async function loginToDrom(
     if (pageAnalysis.needsVerification) {
       console.log('📱 Требуется подтверждение устройства');
       
-      // Сохраняем скриншот и HTML ДО клика
       const timestamp = Date.now();
       const screenshotFilename = `verification_${timestamp}.png`;
       const htmlFilename = `verification_${timestamp}.html`;
@@ -197,13 +192,11 @@ async function loginToDrom(
       };
       
       if (!verificationCode) {
-        // Кликаем по кнопке "Отправить код на телефон"
         let clicked = false;
         
         console.log('📞 Найдено элементов с "телефон":', pageAnalysis.phoneElements.length);
         console.log('Элементы:', pageAnalysis.phoneElements);
         
-        // Способ 1: Клик по тексту "Отправить код на телефон"
         try {
           await page.click('text=Отправить код на телефон', { timeout: 3000 });
           console.log('✅ Нажат через text=Отправить код на телефон');
@@ -213,7 +206,6 @@ async function loginToDrom(
           console.log('⚠️ Не удалось нажать через текст "Отправить код на телефон"');
         }
         
-        // Способ 2: Клик по частичному тексту "телефон"
         if (!clicked) {
           try {
             await page.click('text=телефон', { timeout: 3000 });
@@ -225,7 +217,6 @@ async function loginToDrom(
           }
         }
         
-        // Способ 3: Универсальный поиск через evaluate
         if (!clicked) {
           try {
             clicked = await page.evaluate(() => {
@@ -257,7 +248,6 @@ async function loginToDrom(
           }
         }
         
-        // СКРИНШОТ ПОСЛЕ КЛИКА
         console.log('📸 Делаем скриншот ПОСЛЕ клика по кнопке телефона...');
         
         const afterClickFilename = `after_phone_click_${timestamp}.png`;
@@ -271,7 +261,6 @@ async function loginToDrom(
         
         console.log('📸 Скриншот ПОСЛЕ клика сохранён:', afterClickPath);
         
-        // Детальный анализ страницы после клика
         const afterClickAnalysis = await page.evaluate(() => {
           const bodyText = document.body.innerText;
           
@@ -309,7 +298,6 @@ async function loginToDrom(
         console.log('  - Есть сообщение об отправке:', afterClickAnalysis.hasSentMessage);
         console.log('  - Превью:', afterClickAnalysis.bodyPreview.substring(0, 200));
         
-        // Добавляем в debugInfo
         debugInfo.afterClickScreenshotUrl = `/debug/${afterClickFilename}`;
         debugInfo.afterClickHtmlUrl = `/debug/${afterClickHtmlFilename}`;
         debugInfo.afterClickAnalysis = afterClickAnalysis;
@@ -381,27 +369,66 @@ async function loginToDrom(
         
         if (submitClicked) {
           console.log('✅ Кнопка подтверждения нажата');
-          await page.waitForTimeout(4000);
+          
+          try {
+            console.log('⏳ Ожидаем редиректа на /personal/...');
+            await page.waitForURL('**/personal/**', { timeout: 15000 });
+            console.log('✅ Редирект на /personal/ выполнен');
+          } catch (e) {
+            console.log('⚠️ Редирект не произошёл за 15 сек, проверяем URL вручную');
+          }
+          
+          await page.waitForTimeout(3000);
         } else {
           console.log('⚠️ Кнопка подтверждения не найдена, ждём автопроверки');
+          
+          try {
+            console.log('⏳ Ожидаем автоматического редиректа...');
+            await page.waitForURL('**/personal/**', { timeout: 15000 });
+            console.log('✅ Редирект на /personal/ выполнен');
+          } catch (e) {
+            console.log('⚠️ Автоматический редирект не произошёл');
+          }
+          
           await page.waitForTimeout(3000);
         }
       } else {
         console.log('❌ Не удалось найти поле ввода кода');
         
-        // Делаем скриншот при ошибке
         const errorScreenshot = path.join(DEBUG_DIR, `error_no_input_${Date.now()}.png`);
         await page.screenshot({ path: errorScreenshot, fullPage: true });
         console.log('📸 Скриншот ошибки сохранён:', errorScreenshot);
       }
     }
     
-    // Проверяем финальный результат
+    // УЛУЧШЕННАЯ проверка финального результата
     await page.waitForTimeout(2000);
-    const finalUrl = page.url();
-    console.log('📍 Финальный URL:', finalUrl);
+    let finalUrl = page.url();
+    console.log('📍 Первый финальный URL:', finalUrl);
+    
+    // Если мы на промежуточной странице /sign/s2/, ждём ещё
+    if (finalUrl.includes('/sign/s2/')) {
+      console.log('⏳ Обнаружена промежуточная страница /sign/s2/, ждём финального редиректа...');
+      
+      try {
+        await page.waitForURL(url => !url.includes('/sign'), { timeout: 10000 });
+        finalUrl = page.url();
+        console.log('✅ Финальный редирект выполнен:', finalUrl);
+      } catch (e) {
+        console.log('⚠️ Финальный редирект не произошёл за 10 сек');
+      }
+      
+      await page.waitForTimeout(2000);
+      finalUrl = page.url();
+      console.log('📍 Финальный URL после ожидания:', finalUrl);
+    }
     
     const isSuccess = finalUrl.includes('/personal') && !finalUrl.includes('/sign');
+    
+    console.log('🔍 Проверка успеха:');
+    console.log('  - URL содержит /personal:', finalUrl.includes('/personal'));
+    console.log('  - URL НЕ содержит /sign:', !finalUrl.includes('/sign'));
+    console.log('  - Итог:', isSuccess);
     
     if (isSuccess) {
       console.log('🎉 Успешный вход! Сохраняем сессию...');
@@ -423,6 +450,11 @@ async function loginToDrom(
       return { success: true, needsVerification: false };
     }
     
+    // Делаем скриншот финальной страницы для дебага
+    const finalScreenshot = path.join(DEBUG_DIR, `final_page_${Date.now()}.png`);
+    await page.screenshot({ path: finalScreenshot, fullPage: true });
+    console.log('📸 Скриншот финальной страницы:', finalScreenshot);
+    
     const hasError = await page.evaluate(() => {
       const errorTexts = ['неверный', 'ошибка', 'неправильный', 'некорректный'];
       const pageText = document.body.innerText.toLowerCase();
@@ -433,14 +465,40 @@ async function loginToDrom(
       return { 
         success: false, 
         needsVerification: false, 
-        message: 'Неверный логин, пароль или код подтверждения' 
+        message: 'Неверный логин, пароль или код подтверждения. Скриншот: /debug/' + path.basename(finalScreenshot)
+      };
+    }
+    
+    // Возможно страница /sign/s2/ - это нормально, проверяем cookies
+    const cookies = await context.cookies();
+    const hasCookies = cookies.length > 0;
+    console.log('🍪 Наличие cookies:', hasCookies, 'штук:', cookies.length);
+    
+    if (hasCookies && finalUrl.includes('/sign/s2/')) {
+      console.log('⚠️ Странный URL /sign/s2/, но cookies есть. Пробуем сохранить и проверить в следующем запросе...');
+      
+      fs.writeFileSync(sessionPath, JSON.stringify({
+        cookies: cookies,
+        timestamp: Date.now(),
+        login: login.substring(0, 3) + '***',
+        verified: true,
+        intermediate: true,
+        userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+      }, null, 2));
+      
+      console.log('✅ Сессия сохранена (промежуточная)');
+      
+      return { 
+        success: true, 
+        needsVerification: false,
+        warning: 'Сессия сохранена, но URL выглядит странно (/sign/s2/). Попробуйте сделать запрос ещё раз - возможно сессия уже работает.'
       };
     }
     
     return { 
       success: false, 
       needsVerification: false, 
-      message: 'Неизвестная ошибка авторизации. URL: ' + finalUrl
+      message: 'Неизвестная ошибка авторизации. URL: ' + finalUrl + '. Скриншот: /debug/' + path.basename(finalScreenshot)
     };
     
   } catch (error: any) {
@@ -491,6 +549,10 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
         success: false,
         message: loginResult.message || 'Ошибка авторизации'
       });
+    }
+    
+    if (loginResult.warning) {
+      console.log('⚠️ Warning:', loginResult.warning);
     }
     
     console.log('💬 Получаем список диалогов...');
@@ -552,7 +614,8 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
     res.json({ 
       success: true,
       count: dialogs.length,
-      dialogs: dialogs
+      dialogs: dialogs,
+      warning: loginResult.warning
     });
     
   } catch (error: any) {
