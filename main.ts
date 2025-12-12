@@ -163,7 +163,16 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
     
     await loginToDrom(page, login, password, context);
     
-    console.log('💬 Запрашиваем список диалогов через API...');
+    // Сначала открываем страницу сообщений чтобы инициализировать сессию
+    console.log('💬 Открываем страницу сообщений...');
+    await page.goto('https://my.drom.ru/personal/messaging-modal?switchPosition=dialogs', { 
+      waitUntil: 'networkidle',
+      timeout: 30000 
+    });
+    await page.waitForTimeout(2000);
+    
+    // Теперь запрашиваем API
+    console.log('📡 Запрашиваем список диалогов через API...');
     const apiUrl = 'https://my.drom.ru/personal/messaging/inbox-list?ajax=1&fromIndex=0&count=50&list=personal';
     
     const response = await page.goto(apiUrl, { 
@@ -172,16 +181,30 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
     });
     
     const jsonText = await response?.text();
-    console.log('📦 API ответ получен, длина:', jsonText?.length);
+    console.log('📦 API ответ:', jsonText);
     
-    if (!jsonText) {
-      throw new Error('Пустой ответ от API');
+    if (!jsonText || jsonText.length < 10) {
+      throw new Error(`Пустой или некорректный ответ от API: ${jsonText}`);
     }
     
     const data = JSON.parse(jsonText);
     
-    if (!data.briefs || !Array.isArray(data.briefs)) {
-      throw new Error('Некорректный формат ответа API');
+    console.log('🔍 Структура данных:', Object.keys(data));
+    
+    if (!data.briefs) {
+      console.log('⚠️ Поле briefs отсутствует. Полный ответ:', JSON.stringify(data));
+      
+      await browser.close();
+      return res.json({
+        success: false,
+        error: 'API не вернул диалоги',
+        apiResponse: data,
+        hint: 'Возможно требуется авторизация или изменился формат API'
+      });
+    }
+    
+    if (!Array.isArray(data.briefs)) {
+      throw new Error('data.briefs не является массивом');
     }
     
     const dialogs = data.briefs.map((brief: any, idx: number) => ({
@@ -208,8 +231,7 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
       source: 'api',
       count: dialogs.length,
       dialogs: dialogs,
-      usedCache: fs.existsSync(getSessionPath(login)),
-      rawApiData: data
+      usedCache: fs.existsSync(getSessionPath(login))
     });
     
   } catch (error: any) {
