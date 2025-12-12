@@ -51,12 +51,10 @@ app.post('/drom/debug-login', async (req: Request, res: Response) => {
 
     const page = await context.newPage();
     
-    // Логируем все console.log из браузера
     page.on('console', (msg: any) => {
       debug.steps.push({ type: 'browser_console', text: msg.text() });
     });
     
-    // ШАГ 1: Переход на страницу входа
     console.log('📍 Шаг 1: Переход на страницу входа');
     debug.steps.push('Переход на https://my.drom.ru/sign');
     
@@ -65,22 +63,24 @@ app.post('/drom/debug-login', async (req: Request, res: Response) => {
     
     debug.urls.push({ step: 1, url: page.url() });
     
-    // Скриншот 1: До заполнения формы
     const screenshot1 = await page.screenshot({ fullPage: false });
     debug.screenshots.before_fill = screenshot1.toString('base64');
     debug.steps.push('Скриншот 1: Страница входа загружена');
     
-    // Проверяем наличие полей формы
+    // ИСПРАВЛЕНО: используем обычные querySelector вместо :has-text
     const formCheck = await page.evaluate(() => {
       const signInput = document.querySelector('input[name="sign"]');
       const passwordInput = document.querySelector('input[type="password"]');
-      const submitButton = document.querySelector('button:has-text("Войти с паролем")') || 
-                          document.querySelector('button[type="submit"]');
+      const submitButtons = Array.from(document.querySelectorAll('button'));
+      const loginButton = submitButtons.find(btn => 
+        btn.textContent?.includes('Войти с паролем') || 
+        btn.textContent?.includes('Войти')
+      );
       
       return {
         hasSignInput: !!signInput,
         hasPasswordInput: !!passwordInput,
-        hasSubmitButton: !!submitButton,
+        hasSubmitButton: !!loginButton,
         signInputVisible: signInput ? (signInput as HTMLElement).offsetParent !== null : false,
         passwordInputVisible: passwordInput ? (passwordInput as HTMLElement).offsetParent !== null : false,
         bodyText: document.body.innerText.substring(0, 500)
@@ -90,29 +90,24 @@ app.post('/drom/debug-login', async (req: Request, res: Response) => {
     debug.steps.push({ type: 'form_check', data: formCheck });
     console.log('🔍 Проверка формы:', formCheck);
     
-    // ШАГ 2: Заполнение логина
     console.log('📝 Шаг 2: Заполняем логин');
     debug.steps.push(`Заполняем поле sign значением: ${login.substring(0, 3)}***`);
     
     await page.fill('input[name="sign"]', login);
     await page.waitForTimeout(1000);
     
-    // Скриншот 2: После ввода логина
     const screenshot2 = await page.screenshot({ fullPage: false });
     debug.screenshots.after_login_input = screenshot2.toString('base64');
     
-    // ШАГ 3: Заполнение пароля
     console.log('🔑 Шаг 3: Заполняем пароль');
     debug.steps.push('Заполняем поле password');
     
     await page.fill('input[type="password"]', password);
     await page.waitForTimeout(1000);
     
-    // Скриншот 3: После ввода пароля
     const screenshot3 = await page.screenshot({ fullPage: false });
     debug.screenshots.after_password_input = screenshot3.toString('base64');
     
-    // Проверяем значения полей перед отправкой
     const inputValues = await page.evaluate(() => {
       const signInput = document.querySelector('input[name="sign"]') as HTMLInputElement;
       const passwordInput = document.querySelector('input[type="password"]') as HTMLInputElement;
@@ -128,11 +123,10 @@ app.post('/drom/debug-login', async (req: Request, res: Response) => {
     debug.steps.push({ type: 'input_values_check', data: inputValues });
     console.log('🔍 Проверка значений полей:', inputValues);
     
-    // ШАГ 4: Клик по кнопке
     console.log('👆 Шаг 4: Нажимаем кнопку входа');
     debug.steps.push('Клик по кнопке "Войти с паролем"');
     
-    // Пытаемся найти кнопку разными способами
+    // ИСПРАВЛЕНО: используем нативный querySelector
     const buttonInfo = await page.evaluate(() => {
       const buttons = Array.from(document.querySelectorAll('button'));
       return buttons.map(btn => ({
@@ -148,15 +142,14 @@ app.post('/drom/debug-login', async (req: Request, res: Response) => {
     debug.steps.push({ type: 'available_buttons', data: buttonInfo });
     console.log('🔍 Доступные кнопки:', buttonInfo);
     
+    // ИСПРАВЛЕНО: используем Playwright селектор (работает в page.click, но не в evaluate)
     await page.click('button:has-text("Войти с паролем")');
     debug.steps.push('Кнопка нажата');
     
-    // Скриншот 4: Сразу после клика
     await page.waitForTimeout(500);
     const screenshot4 = await page.screenshot({ fullPage: false });
     debug.screenshots.after_submit_click = screenshot4.toString('base64');
     
-    // ШАГ 5: Ждём навигации
     console.log('⏳ Шаг 5: Ждём навигации...');
     debug.steps.push('Ожидание навигации');
     
@@ -172,16 +165,13 @@ app.post('/drom/debug-login', async (req: Request, res: Response) => {
     
     debug.urls.push({ step: 5, url: page.url(), navigationHappened });
     
-    // Ждём дополнительное время
     await page.waitForTimeout(3000);
     
-    // Скриншот 5: После попытки навигации
     const screenshot5 = await page.screenshot({ fullPage: true });
     debug.screenshots.after_navigation = screenshot5.toString('base64');
     
     debug.urls.push({ step: 'final', url: page.url() });
     
-    // ШАГ 6: Проверка результата
     console.log('🔍 Шаг 6: Проверяем результат');
     const finalCheck = await page.evaluate(() => {
       return {
@@ -198,7 +188,6 @@ app.post('/drom/debug-login', async (req: Request, res: Response) => {
     debug.steps.push({ type: 'final_check', data: finalCheck });
     console.log('🔍 Финальная проверка:', finalCheck);
     
-    // Сохраняем cookies
     const cookies = await context.cookies();
     debug.cookies.count = cookies.length;
     debug.cookies.list = cookies.map(c => ({ name: c.name, domain: c.domain, path: c.path }));
@@ -206,7 +195,6 @@ app.post('/drom/debug-login', async (req: Request, res: Response) => {
     
     await browser.close();
     
-    // Определяем успешность
     const isSuccess = finalCheck.currentUrl.includes('/personal') && 
                      !finalCheck.currentUrl.includes('/sign') &&
                      !finalCheck.hasErrorText;
