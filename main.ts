@@ -138,6 +138,7 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
   console.log('🔍 Получаем сообщения с Дром для:', login.substring(0, 3) + '***');
   
   let screenshotBase64 = '';
+  let debugInfo: any = {};
   
   try {
     const browser = await chromium.launch({
@@ -159,64 +160,160 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
 
     const page = await context.newPage();
     
-    // Авторизация с поддержкой сессий
+    // Логируем все console.log из браузера
+    page.on('console', (msg: any) => {
+      console.log('🌐 Browser console:', msg.text());
+    });
+    
+    // Авторизация
     await loginToDrom(page, login, password, context);
     
-    // Переход в сообщения (ваш URL)
-    if (!page.url().includes('personal/messaging-modal')) {
-      console.log('💬 Открываем чаты...');
-      await page.goto('https://my.drom.ru/personal/messaging-modal?switchPosition=dialogs', { 
-        waitUntil: 'domcontentloaded',
-        timeout: 30000 
-      });
-    }
+    // Переход в сообщения
+    console.log('💬 Переходим на страницу сообщений...');
+    await page.goto('https://my.drom.ru/personal/messaging-modal?switchPosition=dialogs', { 
+      waitUntil: 'domcontentloaded',
+      timeout: 30000 
+    });
     
-    // Улучшенное ожидание загрузки диалогов
-    console.log('⏳ Ждём загрузки диалогов...');
+    debugInfo.url_after_goto = page.url();
+    console.log('📍 URL после goto:', debugInfo.url_after_goto);
     
-    // Ждём появления списка диалогов
-    try {
-      await page.waitForSelector('.dialog-list__li', { timeout: 20000, state: 'visible' });
-      console.log('✅ Диалоги найдены');
-    } catch (e) {
-      console.log('⚠️ Селектор .dialog-list__li не найден за 20 сек');
-    }
+    // Ждём 3 секунды для начальной загрузки
+    await page.waitForTimeout(3000);
     
-    // Ждём стабилизации DOM (пока список не перестанет расти)
-    let previousCount = 0;
-    let stableCount = 0;
+    // DEBUG: Проверяем, есть ли на странице нужные элементы
+    debugInfo.page_analysis = await page.evaluate(() => {
+      return {
+        hasDialogList: !!document.querySelector('.dialog-list'),
+        hasDialogListLi: !!document.querySelector('.dialog-list__li'),
+        dialogListLiCount: document.querySelectorAll('.dialog-list__li').length,
+        bodyClasses: document.body.className,
+        bodyText: document.body.innerText.substring(0, 500),
+        allClassesStartingWithDialog: Array.from(new Set(
+          Array.from(document.querySelectorAll('[class*="dialog"]')).map(el => el.className)
+        )).slice(0, 20),
+        iframeCount: document.querySelectorAll('iframe').length,
+        iframeSrcs: Array.from(document.querySelectorAll('iframe')).map(f => (f as HTMLIFrameElement).src)
+      };
+    });
     
-    for (let i = 0; i < 10; i++) {
-      await page.waitForTimeout(1000);
+    console.log('🔍 Анализ страницы:', JSON.stringify(debugInfo.page_analysis, null, 2));
+    
+    // Если есть iframe - проверяем его содержимое
+    if (debugInfo.page_analysis.iframeCount > 0) {
+      console.log('🖼️ Обнаружены iframe, проверяем...');
       
-      const currentCount = await page.evaluate(() => {
-        return document.querySelectorAll('.dialog-list__li').length;
-      });
+      const frames = page.frames();
+      console.log(`📦 Найдено фреймов: ${frames.length}`);
       
-      if (currentCount === previousCount && currentCount > 0) {
-        stableCount++;
-        if (stableCount >= 2) {
-          console.log(`✅ Список стабилизировался: ${currentCount} диалогов`);
-          break;
+      for (let i = 0; i < frames.length; i++) {
+        const frame = frames[i];
+        console.log(`🔎 Фрейм ${i}: ${frame.url()}`);
+        
+        try {
+          const frameDialogsCount = await frame.evaluate(() => {
+            return document.querySelectorAll('.dialog-list__li').length;
+          });
+          
+          if (frameDialogsCount > 0) {
+            console.log(`✅ Диалоги найдены во фрейме ${i}: ${frameDialogsCount} шт`);
+            debugInfo.dialogs_in_frame = i;
+            
+            // Парсим из фрейма
+            const dialogs = await frame.evaluate(() => {
+              const chats: any[] = [];
+              
+              document.querySelectorAll('.dialog-list__li').forEach((li, idx) => {
+                const dialogBrief = li.querySelector('.dialog-brief');
+                const link = li.querySelector('.dialog-list__link') as HTMLAnchorElement;
+                
+                if (!dialogBrief || !link) return;
+                
+                const dialogId = dialogBrief.getAttribute('data-dialog-id');
+                const interlocutor = dialogBrief.getAttribute('data-interlocutor');
+                const latestMessage = dialogBrief.querySelector('.dialog-brief__latest_msg')?.textContent?.trim();
+                const userName = dialogBrief.querySelector('.dialog-brief__interlocutor')?.textContent?.trim();
+                const time = dialogBrief.querySelector('.bzr-dialog__message-dt')?.textContent?.trim();
+                const avatarStyle = dialogBrief.querySelector('.dialog-brief__image')?.getAttribute('style');
+                const avatarUrl = avatarStyle?.match(/url\((.*?)\)/)?.[1]?.replace(/['"]/g, '');
+                const chatUrl = link.href;
+                
+                chats.push({
+                  id: idx,
+                  dialogId: dialogId,
+                  interlocutor: interlocutor || userName,
+                  userName: userName,
+                  latestMessage: latestMessage,
+                  time: time,
+                  avatar: avatarUrl,
+                  chatUrl: chatUrl,
+                  unread: li.classList.contains('unread') || li.classList.contains('new')
+                });
+              });
+              
+              return chats;
+            });
+            
+            const screenshotBuffer = await page.screenshot({ fullPage: true });
+            screenshotBase64 = screenshotBuffer.toString('base64');
+            
+            await browser.close();
+            
+            console.log(`✅ Найдено диалогов во фрейме: ${dialogs.length}`);
+            
+            return res.json({ 
+              success: true,
+              currentUrl: page.url(),
+              count: dialogs.length,
+              dialogs,
+              screenshotBase64: screenshotBase64,
+              usedCache: fs.existsSync(getSessionPath(login)),
+              debug: debugInfo
+            });
+          }
+        } catch (e) {
+          console.log(`⚠️ Ошибка проверки фрейма ${i}:`, e);
         }
-      } else {
-        stableCount = 0;
       }
-      
-      previousCount = currentCount;
     }
     
-    // Дополнительная пауза
+    // Если во фреймах не нашли - пробуем в основной странице
+    console.log('⏳ Ждём загрузки в основной странице...');
+    
+    // Пробуем разные стратегии ожидания
+    let loaded = false;
+    
+    // Стратегия 1: waitForSelector с разными таймаутами
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      console.log(`🔄 Попытка ${attempt}/3 найти .dialog-list__li`);
+      try {
+        await page.waitForSelector('.dialog-list__li', { timeout: 10000, state: 'visible' });
+        loaded = true;
+        console.log('✅ Элементы найдены');
+        break;
+      } catch (e) {
+        console.log(`⚠️ Попытка ${attempt} не удалась`);
+        await page.waitForTimeout(3000);
+      }
+    }
+    
+    // Стратегия 2: Скроллинг (иногда диалоги подгружаются при скролле)
+    console.log('📜 Пробуем проскроллить страницу...');
+    await page.evaluate(() => {
+      window.scrollTo(0, 500);
+    });
     await page.waitForTimeout(2000);
     
-    const currentUrl = page.url();
-    console.log('📍 Текущий URL:', currentUrl);
+    await page.evaluate(() => {
+      window.scrollTo(0, 0);
+    });
+    await page.waitForTimeout(2000);
     
-    // Скриншот
+    // Финальный скриншот
     const screenshotBuffer = await page.screenshot({ fullPage: true });
     screenshotBase64 = screenshotBuffer.toString('base64');
     
-    // Парсим диалоги
+    // Финальный парсинг
     const dialogs = await page.evaluate(() => {
       const chats: any[] = [];
       
@@ -251,17 +348,25 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
       return chats;
     });
     
+    // Дополнительная диагностика если ничего не нашли
+    if (dialogs.length === 0) {
+      debugInfo.final_html_sample = await page.evaluate(() => {
+        return document.body.innerHTML.substring(0, 2000);
+      });
+    }
+    
     await browser.close();
     
     console.log(`✅ Найдено диалогов: ${dialogs.length}`);
     
     res.json({ 
       success: true,
-      currentUrl,
+      currentUrl: page.url(),
       count: dialogs.length,
       dialogs,
       screenshotBase64: screenshotBase64,
-      usedCache: fs.existsSync(getSessionPath(login))
+      usedCache: fs.existsSync(getSessionPath(login)),
+      debug: debugInfo
     });
     
   } catch (error: any) {
@@ -270,7 +375,8 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
       success: false,
       error: error.message, 
       stack: error.stack,
-      screenshotBase64: screenshotBase64 || 'not_captured'
+      screenshotBase64: screenshotBase64 || 'not_captured',
+      debug: debugInfo
     });
   }
 });
