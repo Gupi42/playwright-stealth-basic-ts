@@ -32,7 +32,6 @@ app.get('/health', (_req: Request, res: Response) => {
 });
 
 // Функция авторизации с сохранением сессии
-// В функции loginToDrom после авторизации добавьте доп. проверку:
 async function loginToDrom(page: any, login: string, password: string, context: any) {
   const sessionPath = getSessionPath(login);
   
@@ -45,8 +44,7 @@ async function loginToDrom(page: any, login: string, password: string, context: 
       if (sessionAge < 24 * 60 * 60 * 1000) {
         await context.addCookies(sessionData.cookies);
         
-        // Проверка сессии - используем простой URL
-        await page.goto('https://www.drom.ru/personal/messaging/', { 
+        await page.goto('https://my.drom.ru/personal/messaging-modal?switchPosition=dialogs', { 
           waitUntil: 'domcontentloaded', 
           timeout: 15000 
         });
@@ -85,14 +83,12 @@ async function loginToDrom(page: any, login: string, password: string, context: 
     
     await page.click('button:has-text("Войти с паролем")');
     
-    // ВАЖНО: Ждём финального редиректа (может быть несколько)
     let redirectAttempts = 0;
     while (redirectAttempts < 5) {
       try {
         await page.waitForNavigation({ timeout: 10000, waitUntil: 'networkidle' });
         console.log(`🔄 Редирект ${redirectAttempts + 1}: ${page.url()}`);
         
-        // Если попали на промежуточную страницу /sign/s2/ - ждём ещё
         if (page.url().includes('/sign/s2/')) {
           console.log('⏳ Промежуточная страница, ждём...');
           await page.waitForTimeout(3000);
@@ -100,7 +96,6 @@ async function loginToDrom(page: any, login: string, password: string, context: 
           continue;
         }
         
-        // Если уже не на странице входа - выходим
         if (!page.url().includes('/sign')) {
           break;
         }
@@ -117,7 +112,6 @@ async function loginToDrom(page: any, login: string, password: string, context: 
     const currentUrl = page.url();
     console.log('📍 Финальный URL после входа:', currentUrl);
     
-    // Проверяем ошибки
     const hasError = await page.evaluate(() => {
       const errorTexts = ['неверный', 'ошибка', 'неправильный', 'captcha'];
       const pageText = document.body.innerText.toLowerCase();
@@ -128,7 +122,6 @@ async function loginToDrom(page: any, login: string, password: string, context: 
       throw new Error('Ошибка авторизации');
     }
     
-    // Сохраняем сессию
     const cookies = await context.cookies();
     fs.writeFileSync(sessionPath, JSON.stringify({
       cookies: cookies,
@@ -159,7 +152,7 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
   
   try {
     const browser = await chromium.launch({
-      headless: false, // ВРЕМЕННО включаем headed режим для дебага
+      headless: true, // Вернул true для Railway
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -176,10 +169,8 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
 
     const page = await context.newPage();
     
-    // Авторизация
     await loginToDrom(page, login, password, context);
     
-    // Переход в сообщения
     console.log('💬 Открываем чаты...');
     await page.goto('https://my.drom.ru/personal/messaging-modal?switchPosition=dialogs', { 
       waitUntil: 'load',
@@ -188,16 +179,15 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
     
     console.log('📍 URL:', page.url());
     
-    // Ждём загрузку страницы и скриптов
     await page.waitForTimeout(3000);
     
-    // НОВЫЙ ПОДХОД: Inject скрипт, который дождётся появления диалогов
     console.log('⏳ Ждём появления диалогов через MutationObserver...');
     
+    // ИСПРАВЛЕНО: убрал TypeScript-синтаксис из evaluate
     const dialogs = await page.evaluate(() => {
       return new Promise((resolve) => {
         let attempts = 0;
-        const maxAttempts = 30; // 30 секунд
+        const maxAttempts = 30;
         
         function checkDialogs() {
           const dialogElements = document.querySelectorAll('.dialog-list__li');
@@ -205,11 +195,11 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
           if (dialogElements.length > 0) {
             console.log('Диалоги найдены!', dialogElements.length);
             
-            const chats: any[] = [];
+            const chats = [];
             
             dialogElements.forEach((li, idx) => {
               const dialogBrief = li.querySelector('.dialog-brief');
-              const link = li.querySelector('.dialog-list__link') as HTMLAnchorElement;
+              const link = li.querySelector('.dialog-list__link');
               
               if (!dialogBrief || !link) return;
               
@@ -247,15 +237,12 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
             return;
           }
           
-          // Проверяем каждую секунду
           setTimeout(checkDialogs, 1000);
         }
         
-        // Запускаем проверку
         checkDialogs();
         
-        // Также подписываемся на изменения DOM
-        const observer = new MutationObserver((mutations) => {
+        const observer = new MutationObserver(() => {
           const hasDialogList = document.querySelector('.dialog-list__li');
           if (hasDialogList) {
             console.log('MutationObserver: диалоги появились!');
@@ -270,22 +257,25 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
       });
     });
     
-    console.log(`✅ Результат: ${dialogs.length} диалогов`);
+    console.log(`✅ Результат: ${Array.isArray(dialogs) ? dialogs.length : 0} диалогов`);
     
-    // Скриншот
     const screenshotBuffer = await page.screenshot({ fullPage: true });
     screenshotBase64 = screenshotBuffer.toString('base64');
     
-    // Дополнительная диагностика
-    if (dialogs.length === 0) {
+    if (!Array.isArray(dialogs) || dialogs.length === 0) {
       debugInfo.html_body = await page.evaluate(() => document.body.innerHTML.substring(0, 3000));
       debugInfo.all_classes = await page.evaluate(() => {
         const elements = document.querySelectorAll('[class*="dialog"]');
-        return Array.from(elements).slice(0, 10).map(el => ({
-          tag: el.tagName,
-          classes: el.className,
-          text: el.textContent?.substring(0, 100)
-        }));
+        const result = [];
+        for (let i = 0; i < Math.min(elements.length, 10); i++) {
+          const el = elements[i];
+          result.push({
+            tag: el.tagName,
+            classes: el.className,
+            text: el.textContent?.substring(0, 100)
+          });
+        }
+        return result;
       });
     }
     
@@ -294,8 +284,8 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
     res.json({ 
       success: true,
       currentUrl: page.url(),
-      count: dialogs.length,
-      dialogs,
+      count: Array.isArray(dialogs) ? dialogs.length : 0,
+      dialogs: dialogs || [],
       screenshotBase64: screenshotBase64,
       usedCache: fs.existsSync(getSessionPath(login)),
       debug: debugInfo
@@ -340,25 +330,20 @@ app.post('/drom/send-message', async (req: Request, res: Response) => {
 
     const page = await context.newPage();
     
-    // Авторизация
     await loginToDrom(page, login, password, context);
     
-    // Переход в конкретный диалог
     const chatUrl = `https://www.drom.ru/personal/messaging/view?dialogId=${dialogId}`;
     console.log('📍 Открываем чат:', chatUrl);
     
     await page.goto(chatUrl, { waitUntil: 'networkidle' });
     await page.waitForTimeout(3000);
     
-    // Ждём поле ввода
     await page.waitForSelector('textarea[name="message"], textarea', { timeout: 10000 });
     
-    // Вводим текст
     console.log('✍️ Вводим текст...');
     await page.fill('textarea[name="message"], textarea', text);
     await page.waitForTimeout(500);
     
-    // Отправляем
     const sendButton = page.locator('button[type="submit"], button:has-text("Отправить")').first();
     if (await sendButton.count() > 0) {
       await sendButton.click();
@@ -370,7 +355,6 @@ app.post('/drom/send-message', async (req: Request, res: Response) => {
     
     await page.waitForTimeout(3000);
     
-    // Проверяем отправку
     const messageSent = await page.evaluate((sentText) => {
       const messages = Array.from(document.querySelectorAll('.bzr-dialog__message_out .bzr-dialog__text'));
       return messages.some(msg => msg.textContent?.includes(sentText));
