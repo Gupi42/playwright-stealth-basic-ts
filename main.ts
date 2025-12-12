@@ -25,11 +25,11 @@ async function loginToDrom(page: any, login: string, password: string) {
   await page.waitForTimeout(2000);
   
   // Заполняем телефон/логин (из скриншота видно: обычный input без атрибута name)
-  await page.fill('input[type="sign"]', login);
+  await page.fill('input[name="sign"]', login);
   await page.waitForTimeout(500);
   
   // Заполняем пароль
-  await page.fill('input[type="password"]', password);
+  await page.fill('input[name="password"]', password);
   await page.waitForTimeout(500);
   
   // Нажимаем "Войти с паролем"
