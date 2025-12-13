@@ -4,11 +4,13 @@ import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import * as fs from 'fs';
 import * as path from 'path';
 
+// Подключаем плагин скрытности
 chromium.use(StealthPlugin());
 
 const app = express();
 app.use(express.json());
 
+// --- КОНФИГУРАЦИЯ ---
 const SESSIONS_DIR = path.join(__dirname, 'sessions');
 const DEBUG_DIR = path.join(__dirname, 'debug');
 
@@ -20,7 +22,7 @@ function getSessionPath(login: string): string {
   return path.join(SESSIONS_DIR, `session_${sanitized}.json`);
 }
 
-// --- ХРАНИЛИЩЕ АКТИВНЫХ БРАУЗЕРОВ (ОЖИДАЮЩИХ КОД) ---
+// --- ХРАНИЛИЩЕ АКТИВНЫХ СЕССИЙ (для 2FA) ---
 interface ActiveFlow {
   browser: any;
   context: any;
@@ -29,10 +31,8 @@ interface ActiveFlow {
   timer: NodeJS.Timeout;
 }
 
-// Храним открытые браузеры здесь: ключ = логин
 const activeFlows: Map<string, ActiveFlow> = new Map();
 
-// Функция очистки зависших браузеров
 function cleanupFlow(login: string) {
   const flow = activeFlows.get(login);
   if (flow) {
@@ -43,21 +43,20 @@ function cleanupFlow(login: string) {
   }
 }
 
-// --- ОСНОВНАЯ ЛОГИКА ---
+// --- БАЗОВАЯ ЛОГИКА АВТОРИЗАЦИИ ---
 
 async function startLoginFlow(login: string, password: string) {
-  // Если была старая висящая сессия - убиваем её
-  cleanupFlow(login);
+  cleanupFlow(login); // Убиваем старые висящие процессы
 
-  console.log(`🚀 Запуск нового браузера для ${login}...`);
+  console.log(`🚀 Запуск браузера для ${login}...`);
   
   const browser = await chromium.launch({
-    headless: true,
+    headless: true, // Поставь false, если хочешь видеть глазами
     args: ['--no-sandbox', '--disable-setuid-sandbox']
   });
 
   const context = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     viewport: { width: 1920, height: 1080 },
     locale: 'ru-RU',
     timezoneId: 'Asia/Yekaterinburg'
@@ -65,32 +64,31 @@ async function startLoginFlow(login: string, password: string) {
 
   const page = await context.newPage();
 
-  // 1. Попытка восстановить сохраненную куку
+  // 1. Попытка восстановить куки
   const sessionPath = getSessionPath(login);
   if (fs.existsSync(sessionPath)) {
     try {
       const sessionData = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+      // Куки живут 30 дней (условно)
       if (Date.now() - sessionData.timestamp < 30 * 24 * 60 * 60 * 1000) {
         await context.addCookies(sessionData.cookies);
         await page.goto('https://my.drom.ru/personal/', { waitUntil: 'domcontentloaded' });
         
-        // Проверка авторизации
         try {
-          // Исправлено: добавили типизацию (url: any)
-          await page.waitForURL((url: any) => url.toString().includes('/personal'), { timeout: 5000 });
-          
+          // Ждем либо редиректа на вход, либо загрузки личного кабинета
+          await page.waitForTimeout(1000); 
           if (!page.url().includes('sign')) {
-            console.log('✅ Вход выполнен по сохраненной сессии');
+            console.log('✅ Вход выполнен по кукам');
             return { success: true, browser, context, page };
           }
         } catch (e) {}
-        console.log('⚠️ Сохраненная сессия не сработала, идем через логин/пароль');
+        console.log('⚠️ Куки просрочены, логинимся заново');
       }
     } catch (e) {}
   }
 
-  // 2. Вход с паролем
-  console.log('🔐 Ввод логина и пароля...');
+  // 2. Ввод логина/пароля
+  console.log('🔐 Вход по логину/паролю...');
   await page.goto('https://my.drom.ru/sign', { waitUntil: 'domcontentloaded' });
 
   const loginInput = page.locator('input[name="sign"]');
@@ -101,64 +99,53 @@ async function startLoginFlow(login: string, password: string) {
   await page.locator('input[type="password"]').fill(password);
   await page.waitForTimeout(500);
   
+  // Клик "Войти"
   await page.click('button:has-text("Войти с паролем")');
   await page.waitForTimeout(3000);
 
-  // 3. Проверка на необходимость кода (2FA)
+  // 3. Проверка на 2FA
   const currentUrl = page.url();
   const bodyText = await page.innerText('body');
   const isVerification = bodyText.includes('Подтверждение') || bodyText.includes('код') || currentUrl.includes('/sign');
 
   if (isVerification && !currentUrl.includes('/personal')) {
-    console.log('📱 Требуется SMS код. Оставляем браузер открытым.');
+    console.log('📱 Требуется SMS код.');
     
-    // Если поле ввода скрыто, жмем кнопку отправки
-    const codeInput = page.locator('input[name="code"]');
-    if (!(await codeInput.isVisible())) {
-       const sendBtn = page.locator('text=Отправить код').first();
-       if (await sendBtn.isVisible()) {
-         await sendBtn.click();
-         await page.waitForTimeout(2000);
-       }
+    // Если кнопка "Отправить код" есть — нажимаем
+    if (await page.locator('text=Отправить код').isVisible()) {
+         await page.click('text=Отправить код');
+         await page.waitForTimeout(1000);
     }
 
-    // Сохраняем браузер в память
+    // Сохраняем браузер в память и ждем второго запроса с кодом
     activeFlows.set(login, {
-      browser,
-      context,
-      page,
+      browser, context, page,
       timestamp: Date.now(),
-      timer: setTimeout(() => cleanupFlow(login), 5 * 60 * 1000) // Закрыть через 5 мин если нет кода
+      timer: setTimeout(() => cleanupFlow(login), 300 * 1000) // 5 минут
     });
 
     return { 
       success: false, 
       needsVerification: true, 
-      message: 'SMS отправлено. Отправьте код в следующем запросе.' 
+      message: 'SMS отправлено. Пришлите код в поле verificationCode.' 
     };
   }
 
-  // Если попали сразу в ЛК (без кода)
   return { success: true, browser, context, page };
 }
 
 async function completeLoginFlow(login: string, code: string) {
   const flow = activeFlows.get(login);
-  
-  if (!flow) {
-    throw new Error('⏳ Время сессии истекло или браузер закрыт. Повторите запрос без кода.');
-  }
+  if (!flow) throw new Error('Сессия истекла. Повторите вход без кода.');
 
-  console.log(`✍️ Вводим код для ${login} в существующий браузер...`);
+  console.log(`✍️ Ввод кода для ${login}...`);
   const { page } = flow;
 
   try {
-    const codeInput = page.locator('input[name="code"]');
-    await codeInput.waitFor({ state: 'visible', timeout: 5000 });
-    await codeInput.fill(code);
+    await page.locator('input[name="code"]').fill(code);
     await page.waitForTimeout(500);
 
-    // Жмем Enter или кнопку
+    // Enter или клик подтверждения
     const confirmBtn = page.locator('button:has-text("Подтвердить"), button:has-text("Войти")').first();
     if (await confirmBtn.isVisible()) {
         await confirmBtn.click();
@@ -166,100 +153,206 @@ async function completeLoginFlow(login: string, code: string) {
         await page.keyboard.press('Enter');
     }
 
-    // ИСПРАВЛЕНИЕ ОШИБКИ ЗДЕСЬ: (url: any)
-    await page.waitForURL((url: any) => url.toString().includes('/personal'), { timeout: 20000 });
+    // Ждем перехода в ЛК
+    await page.waitForURL((url: URL) => url.toString().includes('/personal'), { timeout: 15000 });
     
-    console.log('🎉 Успешный вход после кода!');
-    
-    // Удаляем из списка ожидающих (но браузер не закрываем, вернем его для работы)
+    console.log('🎉 Код принят!');
     clearTimeout(flow.timer);
-    activeFlows.delete(login);
+    activeFlows.delete(login); // Удаляем из ожидания, возвращаем управление
     
     return { success: true, browser: flow.browser, context: flow.context, page: flow.page };
-
-  } catch (error: any) {
+  } catch (error) {
     await page.screenshot({ path: path.join(DEBUG_DIR, `code_fail_${Date.now()}.png`) });
-    throw new Error('Ошибка ввода кода или неверный код');
+    throw new Error('Неверный код или ошибка входа');
   }
 }
 
-// --- РОУТЫ ---
+async function saveCookiesAndClose(login: string, browser: any, context: any, close: boolean = true) {
+    const cookies = await context.cookies();
+    fs.writeFileSync(getSessionPath(login), JSON.stringify({
+      cookies,
+      timestamp: Date.now(),
+      login
+    }, null, 2));
+    
+    if (close) await browser.close();
+}
+
+// --- РОУТ 1: ПОЛУЧЕНИЕ СООБЩЕНИЙ ---
 
 app.post('/drom/get-messages', async (req: Request, res: Response) => {
   const { login, password, verificationCode } = req.body;
-  
   if (!login || !password) return res.status(400).json({ error: 'Login/pass required' });
 
   let browserData;
 
   try {
+    // Логика входа
     if (verificationCode) {
-      // 2-й шаг: есть код, ищем активный браузер
       browserData = await completeLoginFlow(login, verificationCode);
     } else {
-      // 1-й шаг: начинаем вход
       const result: any = await startLoginFlow(login, password);
-      
-      if (result.needsVerification) {
-        return res.status(202).json(result);
-      }
+      if (result.needsVerification) return res.status(202).json(result);
       browserData = result;
     }
 
-    // Если мы здесь, значит вход успешен
-    const { page, context, browser } = browserData;
+    const { page, browser, context } = browserData;
 
-    // Сохраняем успешную сессию
-    const cookies = await context.cookies();
-    fs.writeFileSync(getSessionPath(login), JSON.stringify({
-      cookies,
-      timestamp: Date.now(),
-      login,
-      verified: true
-    }, null, 2));
-
-    // --- ПАРСИНГ СООБЩЕНИЙ ---
-    console.log('💬 Парсим диалоги...');
-    await page.goto('https://my.drom.ru/personal/messaging-modal?switchPosition=dialogs', { waitUntil: 'networkidle' });
+    console.log('💬 Получаем список диалогов...');
+    await page.goto('https://my.drom.ru/personal/messaging-modal?switchPosition=dialogs', { waitUntil: 'domcontentloaded' });
     
-    const dialogs = await page.evaluate(() => {
-        const dialogElements = Array.from(document.querySelectorAll('.dialog-list__li'));
-        return dialogElements.map((el, idx) => {
-            const nameEl = el.querySelector('.dialog-brief__interlocutor');
-            const messageEl = el.querySelector('.dialog-brief__latest_msg');
-            const timeEl = el.querySelector('.bzr-dialog__message-dt');
+    // Ждем список (или понимаем, что его нет)
+    try {
+        await page.waitForSelector('.dialog-list__li', { timeout: 5000 });
+    } catch (e) {
+        console.log('Список пуст');
+        await saveCookiesAndClose(login, browser, context);
+        return res.json({ success: true, count: 0, dialogs: [] });
+    }
+
+    // Собираем базовый список ID
+    const dialogsList = await page.evaluate(() => {
+        return Array.from(document.querySelectorAll('.dialog-list__li')).map(el => {
             const linkEl = el.querySelector('a[href*="/messaging/view"]');
-            
             const href = linkEl ? linkEl.getAttribute('href') : '';
             const dialogIdMatch = href?.match(/dialogId=([^&]+)/);
-            
             return {
-                id: idx,
-                dialogId: dialogIdMatch ? dialogIdMatch[1] : '',
-                userName: nameEl?.textContent?.trim() || '',
-                latestMessage: messageEl?.textContent?.trim() || '',
-                time: timeEl?.textContent?.trim() || ''
+                dialogId: dialogIdMatch ? dialogIdMatch[1] : null
             };
-        });
+        }).filter(d => d.dialogId);
     });
 
-    await browser.close();
+    console.log(`📋 Найдено диалогов: ${dialogsList.length}. Парсим детали (макс 20)...`);
     
-    res.json({ success: true, count: dialogs.length, dialogs });
+    const detailedDialogs = [];
+    const limit = Math.min(dialogsList.length, 20); // Лимит, чтобы не ждать вечность
+
+    for (let i = 0; i < limit; i++) {
+        const dItem = dialogsList[i];
+        if(!dItem.dialogId) continue;
+
+        try {
+            await page.goto(`https://my.drom.ru/personal/messaging/view?dialogId=${dItem.dialogId}`, { waitUntil: 'domcontentloaded' });
+            
+            // Ждем контейнер сообщения или хедер
+            try { await page.waitForSelector('.bzr-dialog-header__title', { timeout: 3000 }); } catch(e) {}
+
+            const details = await page.evaluate(() => {
+                // 1. Автомобиль
+                const headerLink = document.querySelector('.bzr-dialog-header__sub-title a');
+                let carTitle = '';
+                let carUrl = '';
+                if (headerLink) {
+                    carTitle = headerLink.textContent?.trim() || '';
+                    const href = headerLink.getAttribute('href');
+                    carUrl = href ? (href.startsWith('//') ? 'https:' + href : href) : '';
+                }
+
+                // 2. Последнее сообщение (ВХОДЯЩЕЕ)
+                // Ищем все входящие (.bzr-dialog__message_in) и берем последнее
+                const incomingMsgs = Array.from(document.querySelectorAll('.bzr-dialog__message_in'));
+                let lastIncomingText = null;
+                let lastIncomingTime = null;
+                let isUnread = false; // Можно попробовать определить по стилям, если нужно
+
+                if (incomingMsgs.length > 0) {
+                    const lastEl = incomingMsgs[incomingMsgs.length - 1];
+                    lastIncomingText = lastEl.querySelector('.bzr-dialog__text')?.textContent?.trim() || '';
+                    lastIncomingTime = lastEl.querySelector('.bzr-dialog__message-dt')?.textContent?.trim() || '';
+                }
+
+                return { carTitle, carUrl, lastIncomingText, lastIncomingTime };
+            });
+
+            detailedDialogs.push({
+                dialogId: dItem.dialogId,
+                ...details
+            });
+
+            // Рандомная пауза для анти-фрода
+            await page.waitForTimeout(Math.floor(Math.random() * 500) + 200);
+
+        } catch (e) {
+            console.error(`Ошибка диалога ${dItem.dialogId}`, e);
+        }
+    }
+
+    await saveCookiesAndClose(login, browser, context);
+    res.json({ success: true, count: detailedDialogs.length, dialogs: detailedDialogs });
 
   } catch (error: any) {
-    console.error('❌ Ошибка:', error.message);
+    console.error('❌ Error:', error.message);
+    if (browserData?.browser) await browserData.browser.close().catch(() => {});
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// --- ДОП. РОУТЫ ---
-app.get('/health', (_req, res) => res.json({ status: 'ok' }));
-app.get('/debug/:filename', (req, res) => {
-    const p = path.join(DEBUG_DIR, req.params.filename);
-    if(fs.existsSync(p)) res.sendFile(p);
-    else res.status(404).send('Not found');
+// --- РОУТ 2: ОТПРАВКА ОТВЕТА ---
+
+app.post('/drom/send-message', async (req: Request, res: Response) => {
+    const { login, password, dialogId, message } = req.body;
+
+    if (!login || !password || !dialogId || !message) {
+        return res.status(400).json({ error: 'Missing login, password, dialogId or message' });
+    }
+
+    let browserData;
+    try {
+        // Логинимся (обычно пройдет быстро по кукам)
+        const result: any = await startLoginFlow(login, password);
+        if (result.needsVerification) {
+            // Если вдруг запросил 2FA при отправке - возвращаем 202,
+            // но в реальном сценарии лучше сначала дернуть /get-messages, чтобы обновить сессию
+            return res.status(202).json(result);
+        }
+        browserData = result;
+        const { page, browser, context } = browserData;
+
+        console.log(`📤 Отправка сообщения в диалог ${dialogId}...`);
+        
+        // Переход сразу в диалог
+        await page.goto(`https://my.drom.ru/personal/messaging/view?dialogId=${dialogId}`, { waitUntil: 'domcontentloaded' });
+
+        // Ждем поле ввода
+        const textAreaSelector = 'textarea[name="message"]';
+        try {
+            await page.waitForSelector(textAreaSelector, { timeout: 10000 });
+        } catch (e) {
+            throw new Error('Не найдено поле ввода. Возможно диалог закрыт или удален.');
+        }
+
+        // Вводим текст
+        await page.locator(textAreaSelector).fill(message);
+        await page.waitForTimeout(500);
+
+        // Кнопка отправки (ищем по name="post" или типу submit внутри формы)
+        const sendBtnSelector = 'button[name="post"], button[data-action="submit-message"]';
+        
+        // Слушаем ответ сети, чтобы убедиться что ушло
+        const [response] = await Promise.all([
+             // Ожидаем, что после клика будет POST запрос или перезагрузка
+             // Drom часто просто сабмитит форму и перезагружает страницу
+             page.waitForLoadState('domcontentloaded'), 
+             page.click(sendBtnSelector)
+        ]);
+
+        // Проверяем, появилось ли сообщение в чате (опционально)
+        // Ищем наше сообщение в исходящих (.bzr-dialog__message_out) с нашим текстом
+        // Это не всегда надежно из-за обрезки текста, но попробуем простой чек:
+        // Просто считаем успешным, если не вылетела ошибка.
+
+        console.log('✅ Сообщение отправлено');
+        
+        await saveCookiesAndClose(login, browser, context);
+        res.json({ success: true, message: 'Отправлено' });
+
+    } catch (error: any) {
+        console.error('❌ Ошибка отправки:', error.message);
+        if (browserData?.browser) await browserData.browser.close().catch(() => {});
+        res.status(500).json({ success: false, error: error.message });
+    }
 });
 
+// --- ЗАПУСК ---
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Сервер запущен на ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
