@@ -138,8 +138,6 @@ async function loginToDrom(
               visible: visible,
               className: el.className,
               id: (el as HTMLElement).id || '',
-              hasTelegram: text.toLowerCase().includes('telegram'),
-              hasCode: text.toLowerCase().includes('код'),
               hasPhone: text.toLowerCase().includes('телефон')
             });
           }
@@ -148,181 +146,54 @@ async function loginToDrom(
       
       return {
         url: window.location.href,
-        title: document.title,
         bodyText: bodyText.substring(0, 1000),
-        needsVerification: bodyText.includes('Подтверждение') || 
-                          bodyText.includes('Telegram') ||
-                          bodyText.includes('код'),
-        clickableElements: allClickableElements,
-        telegramElements: allClickableElements.filter(el => el.hasTelegram),
-        phoneElements: allClickableElements.filter(el => el.hasPhone),
-        codeElements: allClickableElements.filter(el => el.hasCode)
+        needsVerification: bodyText.includes('Подтверждение') || bodyText.includes('код'),
+        phoneElements: allClickableElements.filter(el => el.hasPhone)
       };
-    });
-    
-    console.log('🔍 Анализ страницы:', {
-      url: pageAnalysis.url,
-      needsVerification: pageAnalysis.needsVerification,
-      phoneElementsCount: pageAnalysis.phoneElements.length
     });
     
     if (pageAnalysis.needsVerification) {
       console.log('📱 Требуется подтверждение устройства');
       
       const timestamp = Date.now();
-      const screenshotFilename = `verification_${timestamp}.png`;
-      const htmlFilename = `verification_${timestamp}.html`;
-      const screenshotPath = path.join(DEBUG_DIR, screenshotFilename);
-      const htmlPath = path.join(DEBUG_DIR, htmlFilename);
-      
+      const screenshotPath = path.join(DEBUG_DIR, `verification_${timestamp}.png`);
       await page.screenshot({ path: screenshotPath, fullPage: true });
-      const html = await page.content();
-      fs.writeFileSync(htmlPath, html, 'utf8');
-      
-      console.log('📸 Скриншот ДО клика сохранён:', screenshotPath);
       
       const debugInfo: any = {
-        screenshotUrl: `/debug/${screenshotFilename}`,
-        htmlUrl: `/debug/${htmlFilename}`,
-        screenshotPath: screenshotPath,
-        htmlPath: htmlPath,
-        phoneElements: pageAnalysis.phoneElements,
-        allClickableElements: pageAnalysis.clickableElements.slice(0, 30),
-        bodyPreview: pageAnalysis.bodyText
+        screenshotUrl: `/debug/verification_${timestamp}.png`,
+        phoneElements: pageAnalysis.phoneElements
       };
       
       if (!verificationCode) {
         let clicked = false;
         
-        console.log('📞 Найдено элементов с "телефон":', pageAnalysis.phoneElements.length);
-        console.log('Элементы:', pageAnalysis.phoneElements);
-        
         try {
           await page.click('text=Отправить код на телефон', { timeout: 3000 });
-          console.log('✅ Нажат через text=Отправить код на телефон');
           clicked = true;
           await page.waitForTimeout(5000);
         } catch (e) {
-          console.log('⚠️ Не удалось нажать через текст "Отправить код на телефон"');
-        }
-        
-        if (!clicked) {
           try {
             await page.click('text=телефон', { timeout: 3000 });
-            console.log('✅ Нажат через text=телефон');
             clicked = true;
             await page.waitForTimeout(5000);
-          } catch (e) {
-            console.log('⚠️ Не удалось нажать через text=телефон');
+          } catch (e2) {
+            console.log('⚠️ Не удалось нажать кнопку телефона');
           }
         }
         
-        if (!clicked) {
-          try {
-            clicked = await page.evaluate(() => {
-              const allElements = Array.from(document.querySelectorAll('a, button'));
-              const phoneElement = allElements.find(el => {
-                const text = (el.textContent || '').toLowerCase();
-                const visible = (el as HTMLElement).offsetParent !== null;
-                return visible && (
-                  text.includes('отправить код на телефон') ||
-                  text.includes('код на телефон') ||
-                  (text.includes('телефон') && text.includes('код'))
-                );
-              });
-              
-              if (phoneElement && phoneElement instanceof HTMLElement) {
-                console.log('Кликаем по элементу:', phoneElement.textContent);
-                phoneElement.click();
-                return true;
-              }
-              return false;
-            });
-            
-            if (clicked) {
-              console.log('✅ Нажат элемент через универсальный поиск');
-              await page.waitForTimeout(5000);
-            }
-          } catch (e) {
-            console.log('⚠️ Универсальный поиск не сработал');
-          }
-        }
-        
-        console.log('📸 Делаем скриншот ПОСЛЕ клика по кнопке телефона...');
-        
-        const afterClickFilename = `after_phone_click_${timestamp}.png`;
-        const afterClickHtmlFilename = `after_phone_click_${timestamp}.html`;
-        const afterClickPath = path.join(DEBUG_DIR, afterClickFilename);
-        const afterClickHtmlPath = path.join(DEBUG_DIR, afterClickHtmlFilename);
-        
+        const afterClickPath = path.join(DEBUG_DIR, `after_phone_${timestamp}.png`);
         await page.screenshot({ path: afterClickPath, fullPage: true });
-        const afterClickHtml = await page.content();
-        fs.writeFileSync(afterClickHtmlPath, afterClickHtml, 'utf8');
-        
-        console.log('📸 Скриншот ПОСЛЕ клика сохранён:', afterClickPath);
-        
-        const afterClickAnalysis = await page.evaluate(() => {
-          const bodyText = document.body.innerText;
-          
-          const inputs = Array.from(document.querySelectorAll('input'));
-          const codeInput = inputs.find(inp => 
-            inp.offsetParent !== null && 
-            (inp.type === 'text' || inp.type === 'tel' || inp.type === 'number' ||
-             inp.placeholder?.toLowerCase().includes('код'))
-          );
-          
-          const hasSentMessage = bodyText.toLowerCase().includes('отправлен') ||
-                                bodyText.toLowerCase().includes('проверьте') ||
-                                bodyText.toLowerCase().includes('введите код') ||
-                                bodyText.toLowerCase().includes('смс');
-          
-          return {
-            url: window.location.href,
-            bodyPreview: bodyText.substring(0, 1500),
-            hasCodeInput: !!codeInput,
-            codeInputDetails: codeInput ? {
-              type: codeInput.type,
-              placeholder: codeInput.placeholder,
-              name: codeInput.name,
-              id: codeInput.id
-            } : null,
-            hasSentMessage: hasSentMessage,
-            hasErrorMessage: bodyText.toLowerCase().includes('ошибка') || 
-                            bodyText.toLowerCase().includes('неверный')
-          };
-        });
-        
-        console.log('🔍 ДЕТАЛЬНЫЙ анализ после клика:');
-        console.log('  - URL:', afterClickAnalysis.url);
-        console.log('  - Есть поле ввода кода:', afterClickAnalysis.hasCodeInput);
-        console.log('  - Есть сообщение об отправке:', afterClickAnalysis.hasSentMessage);
-        console.log('  - Превью:', afterClickAnalysis.bodyPreview.substring(0, 200));
-        
-        debugInfo.afterClickScreenshotUrl = `/debug/${afterClickFilename}`;
-        debugInfo.afterClickHtmlUrl = `/debug/${afterClickHtmlFilename}`;
-        debugInfo.afterClickAnalysis = afterClickAnalysis;
-        debugInfo.clicked = clicked;
-        
-        let message = '';
-        if (afterClickAnalysis.hasSentMessage) {
-          message = '✅ SMS код должен быть отправлен на телефон! Проверьте SMS и введите код в поле verificationCode.';
-        } else if (afterClickAnalysis.hasCodeInput) {
-          message = '⚠️ Поле ввода кода найдено. Проверьте SMS на телефоне и введите код в поле verificationCode.';
-        } else {
-          message = `⚠️ Клик ${clicked ? 'выполнен' : 'НЕ выполнен'}. Проверьте скриншот afterClickScreenshotUrl.`;
-        }
+        debugInfo.afterClickScreenshotUrl = `/debug/after_phone_${timestamp}.png`;
         
         return { 
           success: false, 
           needsVerification: true,
-          message: message,
+          message: '✅ SMS код отправлен! Введите его в поле verificationCode',
           debug: debugInfo
         };
       }
       
-      // Вводим код подтверждения
-      console.log('🔢 Вводим код подтверждения:', verificationCode);
-      
+      // Вводим код
       await page.waitForTimeout(2000);
       
       const inputFilled = await page.evaluate((code: string) => {
@@ -336,169 +207,54 @@ async function loginToDrom(
           codeInput.value = code;
           codeInput.dispatchEvent(new Event('input', { bubbles: true }));
           codeInput.dispatchEvent(new Event('change', { bubbles: true }));
-          console.log('Код введён в поле:', codeInput.name || codeInput.id);
           return true;
         }
         return false;
       }, verificationCode);
       
       if (inputFilled) {
-        console.log('✅ Код введён');
         await page.waitForTimeout(1500);
         
-        const submitClicked = await page.evaluate(() => {
-          const buttons = Array.from(document.querySelectorAll('button, [type="submit"], a'));
+        await page.evaluate(() => {
+          const buttons = Array.from(document.querySelectorAll('button, [type="submit"]'));
           const submitBtn = buttons.find(btn => {
             const text = (btn.textContent || '').toLowerCase();
             const visible = (btn as HTMLElement).offsetParent !== null;
-            return visible && (
-              text.includes('подтвердить') || 
-              text.includes('войти') ||
-              text.includes('отправить') ||
-              btn.getAttribute('type') === 'submit'
-            );
+            return visible && (text.includes('подтвердить') || text.includes('войти'));
           });
           
           if (submitBtn && submitBtn instanceof HTMLElement) {
-            console.log('Нажимаем кнопку:', submitBtn.textContent);
             submitBtn.click();
-            return true;
           }
-          return false;
         });
         
-        if (submitClicked) {
-          console.log('✅ Кнопка подтверждения нажата');
-          
-          try {
-            console.log('⏳ Ожидаем редиректа на /personal/...');
-            await page.waitForURL('**/personal/**', { timeout: 15000 });
-            console.log('✅ Редирект на /personal/ выполнен');
-          } catch (e) {
-            console.log('⚠️ Редирект не произошёл за 15 сек, проверяем URL вручную');
-          }
-          
-          await page.waitForTimeout(3000);
-        } else {
-          console.log('⚠️ Кнопка подтверждения не найдена, ждём автопроверки');
-          
-          try {
-            console.log('⏳ Ожидаем автоматического редиректа...');
-            await page.waitForURL('**/personal/**', { timeout: 15000 });
-            console.log('✅ Редирект на /personal/ выполнен');
-          } catch (e) {
-            console.log('⚠️ Автоматический редирект не произошёл');
-          }
-          
-          await page.waitForTimeout(3000);
-        }
-      } else {
-        console.log('❌ Не удалось найти поле ввода кода');
-        
-        const errorScreenshot = path.join(DEBUG_DIR, `error_no_input_${Date.now()}.png`);
-        await page.screenshot({ path: errorScreenshot, fullPage: true });
-        console.log('📸 Скриншот ошибки сохранён:', errorScreenshot);
+        await page.waitForTimeout(5000);
       }
     }
     
-    // УЛУЧШЕННАЯ проверка финального результата
+    // Проверка успеха
     await page.waitForTimeout(2000);
-    let finalUrl = page.url();
-    console.log('📍 Первый финальный URL:', finalUrl);
-    
-    // Если мы на промежуточной странице /sign/s2/, ждём ещё
-    if (finalUrl.includes('/sign/s2/')) {
-      console.log('⏳ Обнаружена промежуточная страница /sign/s2/, ждём финального редиректа...');
-      
-      try {
-        await page.waitForURL((url: string) => !url.includes('/sign'), { timeout: 10000 });
-        finalUrl = page.url();
-        console.log('✅ Финальный редирект выполнен:', finalUrl);
-      } catch (e) {
-        console.log('⚠️ Финальный редирект не произошёл за 10 сек');
-      }
-      
-      await page.waitForTimeout(2000);
-      finalUrl = page.url();
-      console.log('📍 Финальный URL после ожидания:', finalUrl);
-    }
-    
-    const isSuccess = finalUrl.includes('/personal') && !finalUrl.includes('/sign');
-    
-    console.log('🔍 Проверка успеха:');
-    console.log('  - URL содержит /personal:', finalUrl.includes('/personal'));
-    console.log('  - URL НЕ содержит /sign:', !finalUrl.includes('/sign'));
-    console.log('  - Итог:', isSuccess);
+    const finalUrl = page.url();
+    const isSuccess = (finalUrl.includes('/personal') && !finalUrl.includes('/sign')) || 
+                      finalUrl.includes('/messaging');
     
     if (isSuccess) {
-      console.log('🎉 Успешный вход! Сохраняем сессию...');
-      
       const cookies = await context.cookies();
-      
       fs.writeFileSync(sessionPath, JSON.stringify({
         cookies: cookies,
         timestamp: Date.now(),
         login: login.substring(0, 3) + '***',
-        verified: true,
-        userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        verified: true
       }, null, 2));
       
       console.log('✅ Авторизация успешна, сессия сохранена');
-      console.log('📁 Путь к сессии:', sessionPath);
-      console.log('🍪 Cookies сохранено:', cookies.length);
-      
       return { success: true, needsVerification: false };
-    }
-    
-    // Делаем скриншот финальной страницы для дебага
-    const finalScreenshot = path.join(DEBUG_DIR, `final_page_${Date.now()}.png`);
-    await page.screenshot({ path: finalScreenshot, fullPage: true });
-    console.log('📸 Скриншот финальной страницы:', finalScreenshot);
-    
-    const hasError = await page.evaluate(() => {
-      const errorTexts = ['неверный', 'ошибка', 'неправильный', 'некорректный'];
-      const pageText = document.body.innerText.toLowerCase();
-      return errorTexts.some(err => pageText.includes(err));
-    });
-    
-    if (hasError) {
-      return { 
-        success: false, 
-        needsVerification: false, 
-        message: 'Неверный логин, пароль или код подтверждения. Скриншот: /debug/' + path.basename(finalScreenshot)
-      };
-    }
-    
-    // Возможно страница /sign/s2/ - это нормально, проверяем cookies
-    const cookies = await context.cookies();
-    const hasCookies = cookies.length > 0;
-    console.log('🍪 Наличие cookies:', hasCookies, 'штук:', cookies.length);
-    
-    if (hasCookies && finalUrl.includes('/sign/s2/')) {
-      console.log('⚠️ Странный URL /sign/s2/, но cookies есть. Пробуем сохранить и проверить в следующем запросе...');
-      
-      fs.writeFileSync(sessionPath, JSON.stringify({
-        cookies: cookies,
-        timestamp: Date.now(),
-        login: login.substring(0, 3) + '***',
-        verified: true,
-        intermediate: true,
-        userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-      }, null, 2));
-      
-      console.log('✅ Сессия сохранена (промежуточная)');
-      
-      return { 
-        success: true, 
-        needsVerification: false,
-        warning: 'Сессия сохранена, но URL выглядит странно (/sign/s2/). Попробуйте сделать запрос ещё раз - возможно сессия уже работает.'
-      };
     }
     
     return { 
       success: false, 
       needsVerification: false, 
-      message: 'Неизвестная ошибка авторизации. URL: ' + finalUrl + '. Скриншот: /debug/' + path.basename(finalScreenshot)
+      message: 'Ошибка авторизации. URL: ' + finalUrl
     };
     
   } catch (error: any) {
@@ -516,14 +272,16 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
   
   console.log('🔍 Получаем сообщения для:', login.substring(0, 3) + '***');
   
+  let browser;
+  
   try {
-    const browser = await chromium.launch({
+    browser = await chromium.launch({
       headless: true,
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
     });
 
     const context = await browser.newContext({
-      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
       viewport: { width: 1920, height: 1080 },
       locale: 'ru-RU',
       timezoneId: 'Asia/Yekaterinburg'
@@ -551,61 +309,54 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
       });
     }
     
-    if (loginResult.warning) {
-      console.log('⚠️ Warning:', loginResult.warning);
-    }
+    console.log('💬 Парсим диалоги со страницы...');
     
-    console.log('💬 Получаем список диалогов...');
-    
-    await page.goto('https://my.drom.ru/personal/messaging-modal', { 
+    // ✅ ПАРСИНГ HTML ВМЕСТО API
+    await page.goto('https://my.drom.ru/personal/messaging-modal?switchPosition=dialogs', { 
       waitUntil: 'networkidle',
       timeout: 30000 
     });
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(3000);
     
-    const apiUrl = 'https://my.drom.ru/personal/messaging/inbox-list?ajax=1&fromIndex=0&count=50&list=personal';
-    const response = await page.goto(apiUrl, { 
-      waitUntil: 'networkidle',
-      timeout: 30000 
+    // Парсим диалоги из HTML
+    const dialogs = await page.evaluate(() => {
+      const dialogElements = Array.from(document.querySelectorAll('.bzr-dialog-brief'));
+      
+      return dialogElements.map((el, idx) => {
+        const nameEl = el.querySelector('.bzr-dialog__interlocutor-name');
+        const messageEl = el.querySelector('.bzr-dialog__latest_msg');
+        const timeEl = el.querySelector('.bzr-dialog__message-dt');
+        const linkEl = el.querySelector('a[href*="/messaging/view"]');
+        const avatarEl = el.querySelector('.bzr-dialog__avatar');
+        
+        const href = linkEl ? linkEl.getAttribute('href') : '';
+        const dialogIdMatch = href?.match(/dialogId=([^&]+)/);
+        const dialogId = dialogIdMatch ? dialogIdMatch[1] : '';
+        
+        let avatarUrl = '';
+        if (avatarEl) {
+          const style = window.getComputedStyle(avatarEl);
+          const bgImage = style.backgroundImage;
+          const urlMatch = bgImage.match(/url\(["']?([^"')]+)["']?\)/);
+          if (urlMatch) {
+            avatarUrl = urlMatch[1];
+          }
+        }
+        
+        return {
+          id: idx,
+          dialogId: dialogId,
+          userName: nameEl?.textContent?.trim() || '',
+          interlocutor: nameEl?.textContent?.trim() || '',
+          latestMessage: messageEl?.textContent?.trim() || '',
+          time: timeEl?.textContent?.trim() || '',
+          avatar: avatarUrl,
+          chatUrl: href ? `https://my.drom.ru${href}` : '',
+          fullUrl: dialogId ? `https://my.drom.ru/personal/messaging/view?dialogId=${dialogId}` : '',
+          isUnread: el.classList.contains('unread') || el.classList.contains('bzr-dialog-brief_unread')
+        };
+      });
     });
-    
-    const jsonText = await response?.text();
-    console.log('📦 API ответ, длина:', jsonText?.length);
-    
-    if (!jsonText || jsonText.length < 10) {
-      await browser.close();
-      return res.status(500).json({
-        success: false,
-        error: 'Пустой ответ от API',
-        response: jsonText
-      });
-    }
-    
-    const data = JSON.parse(jsonText);
-    
-    if (!data.briefs || !Array.isArray(data.briefs)) {
-      await browser.close();
-      return res.json({
-        success: false,
-        error: 'API не вернул диалоги',
-        apiResponse: data
-      });
-    }
-    
-    const dialogs = data.briefs.map((brief: any, idx: number) => ({
-      id: idx,
-      dialogId: brief.dialogId,
-      interlocutor: brief.interlocutor,
-      userName: brief.interlocutor,
-      latestMessage: brief.html?.match(/dialog-brief__latest_msg[^>]*>([^<]+)</)?.[1]?.trim() || '',
-      time: brief.html?.match(/bzr-dialog__message-dt[^>]*>([^<]+)</)?.[1]?.trim() || '',
-      avatar: brief.html?.match(/background-image:\s*url\(([^)]+)\)/)?.[1] || '',
-      chatUrl: `https://my.drom.ru${brief.url}`,
-      fullUrl: `https://my.drom.ru/personal/messaging/view?dialogId=${brief.dialogId}`,
-      isUnread: brief.isUnread,
-      lastMessageDate: brief.lastMessageDate,
-      canRemove: brief.canRemoveDialog
-    }));
     
     await browser.close();
     
@@ -614,12 +365,14 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
     res.json({ 
       success: true,
       count: dialogs.length,
-      dialogs: dialogs,
-      warning: loginResult.warning
+      dialogs: dialogs
     });
     
   } catch (error: any) {
     console.error('❌ Ошибка:', error.message);
+    if (browser) {
+      await browser.close();
+    }
     res.status(500).json({ 
       success: false,
       error: error.message
@@ -636,10 +389,10 @@ app.post('/drom/send-message', async (req: Request, res: Response) => {
     });
   }
   
-  console.log(`📤 Отправляем сообщение в диалог ${dialogId}`);
+  let browser;
   
   try {
-    const browser = await chromium.launch({
+    browser = await chromium.launch({
       headless: true,
       args: ['--no-sandbox', '--disable-setuid-sandbox']
     });
@@ -674,24 +427,19 @@ app.post('/drom/send-message', async (req: Request, res: Response) => {
     }
     
     const chatUrl = `https://my.drom.ru/personal/messaging/view?dialogId=${dialogId}`;
-    console.log('📍 Открываем чат:', chatUrl);
     
     await page.goto(chatUrl, { waitUntil: 'networkidle' });
     await page.waitForTimeout(3000);
     
     await page.waitForSelector('textarea[name="message"]', { timeout: 10000 });
-    
-    console.log('✍️ Вводим текст...');
     await page.fill('textarea[name="message"]', text);
     await page.waitForTimeout(500);
     
     const sendButton = page.locator('button[name="post"][value="Отправить"]').first();
     if (await sendButton.count() > 0) {
       await sendButton.click();
-      console.log('✅ Кнопка отправки нажата');
     } else {
       await page.keyboard.press('Enter');
-      console.log('✅ Нажат Enter');
     }
     
     await page.waitForTimeout(3000);
@@ -712,6 +460,9 @@ app.post('/drom/send-message', async (req: Request, res: Response) => {
     
   } catch (error: any) {
     console.error('❌ Ошибка отправки:', error.message);
+    if (browser) {
+      await browser.close();
+    }
     res.status(500).json({ error: error.message });
   }
 });
@@ -720,7 +471,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Drom automation service на порту ${PORT}`);
   console.log(`📍 Health: http://localhost:${PORT}/health`);
-  console.log(`📍 Debug files: http://localhost:${PORT}/debug`);
+  console.log(`📍 Debug: http://localhost:${PORT}/debug`);
   console.log(`📍 Get Messages: POST http://localhost:${PORT}/drom/get-messages`);
   console.log(`📍 Send Message: POST http://localhost:${PORT}/drom/send-message`);
 });
