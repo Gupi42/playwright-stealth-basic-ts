@@ -65,7 +65,7 @@ async function startLoginFlow(login: string, password: string) {
 
   const page = await context.newPage();
 
-  // 1. Попытка восстановить сохраненную куку (чтобы не логиниться зря)
+  // 1. Попытка восстановить сохраненную куку
   const sessionPath = getSessionPath(login);
   if (fs.existsSync(sessionPath)) {
     try {
@@ -76,7 +76,9 @@ async function startLoginFlow(login: string, password: string) {
         
         // Проверка авторизации
         try {
-          await page.waitForURL('**/personal/**', { timeout: 5000 });
+          // Исправлено: добавили типизацию (url: any)
+          await page.waitForURL((url: any) => url.toString().includes('/personal'), { timeout: 5000 });
+          
           if (!page.url().includes('sign')) {
             console.log('✅ Вход выполнен по сохраненной сессии');
             return { success: true, browser, context, page };
@@ -164,7 +166,9 @@ async function completeLoginFlow(login: string, code: string) {
         await page.keyboard.press('Enter');
     }
 
-    await page.waitForURL(url => url.toString().includes('/personal'), { timeout: 20000 });
+    // ИСПРАВЛЕНИЕ ОШИБКИ ЗДЕСЬ: (url: any)
+    await page.waitForURL((url: any) => url.toString().includes('/personal'), { timeout: 20000 });
+    
     console.log('🎉 Успешный вход после кода!');
     
     // Удаляем из списка ожидающих (но браузер не закрываем, вернем его для работы)
@@ -202,7 +206,7 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
       browserData = result;
     }
 
-    // Если мы здесь, значит вход успешен (или по кукам, или по коду)
+    // Если мы здесь, значит вход успешен
     const { page, context, browser } = browserData;
 
     // Сохраняем успешную сессию
@@ -219,7 +223,6 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
     await page.goto('https://my.drom.ru/personal/messaging-modal?switchPosition=dialogs', { waitUntil: 'networkidle' });
     
     const dialogs = await page.evaluate(() => {
-        // ... (Твой код парсинга остался без изменений) ...
         const dialogElements = Array.from(document.querySelectorAll('.bzr-dialog-brief'));
         return dialogElements.map((el, idx) => {
             const nameEl = el.querySelector('.bzr-dialog__interlocutor-name');
@@ -240,20 +243,17 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
         });
     });
 
-    // Важно: закрываем браузер только когда вся работа сделана
     await browser.close();
     
     res.json({ success: true, count: dialogs.length, dialogs });
 
   } catch (error: any) {
     console.error('❌ Ошибка:', error.message);
-    // Если упали, пробуем закрыть браузер, если он был создан тут
-    // Но не закрываем, если он в activeFlows и ждет кода (хотя в catch мы уже скорее всего потеряли контекст)
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// --- ДОП. РОУТЫ (Health/Debug) ---
+// --- ДОП. РОУТЫ ---
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 app.get('/debug/:filename', (req, res) => {
     const p = path.join(DEBUG_DIR, req.params.filename);
