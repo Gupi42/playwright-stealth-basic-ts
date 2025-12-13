@@ -223,10 +223,10 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
     await page.goto('https://my.drom.ru/personal/messaging-modal?switchPosition=dialogs', { waitUntil: 'networkidle' });
     
     const dialogs = await page.evaluate(() => {
-        const dialogElements = Array.from(document.querySelectorAll('.bzr-dialog-brief'));
+        const dialogElements = Array.from(document.querySelectorAll('.dialog-list__li'));
         return dialogElements.map((el, idx) => {
-            const nameEl = el.querySelector('.bzr-dialog__interlocutor-name');
-            const messageEl = el.querySelector('.bzr-dialog__latest_msg');
+            const nameEl = el.querySelector('.dialog-brief__interlocutor');
+            const messageEl = el.querySelector('.dialog-brief__latest_msg');
             const timeEl = el.querySelector('.bzr-dialog__message-dt');
             const linkEl = el.querySelector('a[href*="/messaging/view"]');
             
