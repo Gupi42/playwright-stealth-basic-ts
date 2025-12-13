@@ -63,202 +63,122 @@ async function loginToDrom(
 ): Promise<{ success: boolean; needsVerification: boolean; message?: string; debug?: any; warning?: string }> {
   const sessionPath = getSessionPath(login);
   
+  // --- БЛОК 1: ПРОВЕРКА СОХРАНЕННОЙ СЕССИИ (Оставляем как было) ---
   if (fs.existsSync(sessionPath)) {
     console.log('🔄 Загружаем сохранённую сессию...');
     try {
       const sessionData = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
-      const sessionAge = Date.now() - sessionData.timestamp;
-      
-      if (sessionAge < 30 * 24 * 60 * 60 * 1000) {
+      if (Date.now() - sessionData.timestamp < 7 * 24 * 60 * 60 * 1000) {
         await context.addCookies(sessionData.cookies);
-        
-        await page.goto('https://my.drom.ru/personal/', { 
-          waitUntil: 'domcontentloaded', 
-          timeout: 15000 
-        });
-        
-        await page.waitForTimeout(2000);
-        
-        const isLoggedIn = await page.evaluate(() => {
-          return !document.body.innerText.includes('Войти') && 
-                 !window.location.href.includes('sign');
-        });
-        
-        if (isLoggedIn) {
-          console.log('✅ Сессия валидна');
-          return { success: true, needsVerification: false };
-        } else {
-          console.log('⚠️ Сессия устарела, удаляем');
-          fs.unlinkSync(sessionPath);
-        }
-      } else {
-        console.log('⚠️ Сессия слишком старая, удаляем');
+        await page.goto('https://my.drom.ru/personal/', { waitUntil: 'domcontentloaded', timeout: 15000 });
+        try {
+            await page.waitForURL('**/personal/**', { timeout: 5000 });
+            if (await page.locator('a[href*="/sign"]').count() === 0) {
+              console.log('✅ Сессия валидна');
+              return { success: true, needsVerification: false };
+            }
+        } catch (e) {}
+        console.log('⚠️ Сессия устарела');
         fs.unlinkSync(sessionPath);
       }
-    } catch (e: any) {
-      console.log('⚠️ Ошибка загрузки сессии:', e.message);
-      if (fs.existsSync(sessionPath)) {
-        fs.unlinkSync(sessionPath);
-      }
-    }
+    } catch (e) {}
   }
   
+  // --- БЛОК 2: АВТОРИЗАЦИЯ ---
   console.log('🔐 Авторизация на Дром...');
   
   try {
-    await page.goto('https://my.drom.ru/sign', { waitUntil: 'networkidle', timeout: 30000 });
-    await page.waitForTimeout(2000);
+    await page.goto('https://my.drom.ru/sign', { waitUntil: 'domcontentloaded' });
     
-    await page.fill('input[name="sign"]', login);
-    await page.waitForTimeout(800);
+    // Ввод логина и пароля
+    const loginInput = page.locator('input[name="sign"]');
+    await loginInput.waitFor({ state: 'visible', timeout: 10000 });
+    await loginInput.fill(login);
+    await page.waitForTimeout(300);
     
-    await page.fill('input[type="password"]', password);
-    await page.waitForTimeout(800);
-    
+    await page.locator('input[type="password"]').fill(password);
+    await page.waitForTimeout(500);
     await page.click('button:has-text("Войти с паролем")');
     
-    await page.waitForTimeout(3000);
+    // Ждем реакции страницы (переход или запрос кода)
+    await page.waitForTimeout(3000); 
+
+    // --- БЛОК 3: ДИАГНОСТИКА СТРАНИЦЫ ПОДТВЕРЖДЕНИЯ ---
     
+    // Проверяем, остались ли мы на странице входа или нас перекинуло на confirm
+    // Признаки 2FA: URL содержит 'sign', текст "код" или "подтверждение"
     const currentUrl = page.url();
-    console.log('📍 URL после входа:', currentUrl);
-    
-    const pageAnalysis = await page.evaluate(() => {
-      const bodyText = document.body.innerText;
-      const allClickableElements: any[] = [];
-      
-      const selectors = ['button', 'a', 'div[onclick]', 'span[onclick]', '[role="button"]'];
-      selectors.forEach(selector => {
-        document.querySelectorAll(selector).forEach(el => {
-          const text = (el.textContent || '').trim();
-          const visible = (el as HTMLElement).offsetParent !== null;
-          if (text.length > 0 && text.length < 200) {
-            allClickableElements.push({
-              tag: el.tagName.toLowerCase(),
-              text: text,
-              visible: visible,
-              className: el.className,
-              id: (el as HTMLElement).id || '',
-              hasPhone: text.toLowerCase().includes('телефон')
-            });
-          }
-        });
-      });
-      
-      return {
-        url: window.location.href,
-        bodyText: bodyText.substring(0, 1000),
-        needsVerification: bodyText.includes('Подтверждение') || bodyText.includes('код'),
-        phoneElements: allClickableElements.filter(el => el.hasPhone)
-      };
-    });
-    
-    if (pageAnalysis.needsVerification) {
-      console.log('📱 Требуется подтверждение устройства');
+    const bodyText = await page.innerText('body');
+    const isVerificationPage = bodyText.includes('Подтверждение') || 
+                               bodyText.includes('код') || 
+                               (currentUrl.includes('/sign') && !bodyText.includes('Войти с паролем'));
+
+    if (isVerificationPage) {
+      console.log('🔍 ПОПАЛИ НА ЭТАП ПРОВЕРКИ. СБОР ИНФОРМАЦИИ...');
       
       const timestamp = Date.now();
-      const screenshotPath = path.join(DEBUG_DIR, `verification_${timestamp}.png`);
+      
+      // 1. Делаем скриншот того, что видит бот
+      const screenshotName = `debug_auth_${timestamp}.png`;
+      const screenshotPath = path.join(DEBUG_DIR, screenshotName);
       await page.screenshot({ path: screenshotPath, fullPage: true });
       
-      const debugInfo: any = {
-        screenshotUrl: `/debug/verification_${timestamp}.png`,
-        phoneElements: pageAnalysis.phoneElements
-      };
-      
-      if (!verificationCode) {
-        let clicked = false;
-        
-        try {
-          await page.click('text=Отправить код на телефон', { timeout: 3000 });
-          clicked = true;
-          await page.waitForTimeout(5000);
-        } catch (e) {
-          try {
-            await page.click('text=телефон', { timeout: 3000 });
-            clicked = true;
-            await page.waitForTimeout(5000);
-          } catch (e2) {
-            console.log('⚠️ Не удалось нажать кнопку телефона');
-          }
-        }
-        
-        const afterClickPath = path.join(DEBUG_DIR, `after_phone_${timestamp}.png`);
-        await page.screenshot({ path: afterClickPath, fullPage: true });
-        debugInfo.afterClickScreenshotUrl = `/debug/after_phone_${timestamp}.png`;
-        
-        return { 
-          success: false, 
-          needsVerification: true,
-          message: '✅ SMS код отправлен! Введите его в поле verificationCode',
-          debug: debugInfo
-        };
-      }
-      
-      // Вводим код
-      await page.waitForTimeout(2000);
-      
-      const inputFilled = await page.evaluate((code: string) => {
+      // 2. Собираем HTML всех инпутов для анализа
+      const inputAnalysis = await page.evaluate(() => {
         const inputs = Array.from(document.querySelectorAll('input'));
-        const codeInput = inputs.find(inp => 
-          inp.offsetParent !== null && 
-          (inp.type === 'text' || inp.type === 'tel' || inp.type === 'number')
-        );
-        
-        if (codeInput) {
-          codeInput.value = code;
-          codeInput.dispatchEvent(new Event('input', { bubbles: true }));
-          codeInput.dispatchEvent(new Event('change', { bubbles: true }));
-          return true;
-        }
-        return false;
-      }, verificationCode);
+        return inputs.map(el => ({
+          outerHTML: el.outerHTML, // Полный HTML тега
+          type: el.type,
+          name: el.name,
+          id: el.id,
+          placeholder: el.placeholder,
+          class: el.className,
+          isVisible: el.offsetParent !== null // Виден ли элемент глазу
+        }));
+      });
       
-      if (inputFilled) {
-        await page.waitForTimeout(1500);
-        
-        await page.evaluate(() => {
-          const buttons = Array.from(document.querySelectorAll('button, [type="submit"]'));
-          const submitBtn = buttons.find(btn => {
-            const text = (btn.textContent || '').toLowerCase();
-            const visible = (btn as HTMLElement).offsetParent !== null;
-            return visible && (text.includes('подтвердить') || text.includes('войти'));
-          });
-          
-          if (submitBtn && submitBtn instanceof HTMLElement) {
-            submitBtn.click();
-          }
-        });
-        
-        await page.waitForTimeout(5000);
-      }
+      console.log('📋 Найденные инпуты:', inputAnalysis);
+
+      // Сохраним полный HTML страницы на всякий случай
+      const htmlPath = path.join(DEBUG_DIR, `debug_page_${timestamp}.html`);
+      fs.writeFileSync(htmlPath, await page.content());
+
+      return { 
+        success: false, 
+        needsVerification: true,
+        message: 'Требуется анализ полей. См. debug поле.',
+        debug: {
+          screenshotUrl: `/debug/${screenshotName}`,
+          foundInputs: inputAnalysis, // <--- ВОТ ЭТО САМОЕ ВАЖНОЕ
+          currentUrl: currentUrl,
+          htmlDumpUrl: `/debug/debug_page_${timestamp}.html`
+        }
+      };
     }
     
-    // Проверка успеха
-    await page.waitForTimeout(2000);
-    const finalUrl = page.url();
-    const isSuccess = (finalUrl.includes('/personal') && !finalUrl.includes('/sign')) || 
-                      finalUrl.includes('/messaging');
-    
-    if (isSuccess) {
+    // Проверка успешного входа (если 2FA не было)
+    if (currentUrl.includes('/personal') || currentUrl.includes('/messaging')) {
       const cookies = await context.cookies();
       fs.writeFileSync(sessionPath, JSON.stringify({
         cookies: cookies,
         timestamp: Date.now(),
-        login: login.substring(0, 3) + '***',
+        login: login,
         verified: true
       }, null, 2));
-      
-      console.log('✅ Авторизация успешна, сессия сохранена');
       return { success: true, needsVerification: false };
     }
     
+    // Если и не вошли, и не 2FA
     return { 
       success: false, 
       needsVerification: false, 
-      message: 'Ошибка авторизации. URL: ' + finalUrl
+      message: 'Непонятное состояние. URL: ' + currentUrl
     };
     
   } catch (error: any) {
-    console.error('❌ Ошибка авторизации:', error.message);
+    console.error('❌ Ошибка:', error.message);
+    const timestamp = Date.now();
+    await page.screenshot({ path: path.join(DEBUG_DIR, `fatal_error_${timestamp}.png`) });
     throw error;
   }
 }
