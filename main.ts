@@ -63,135 +63,157 @@ async function loginToDrom(
 ): Promise<{ success: boolean; needsVerification: boolean; message?: string; debug?: any; warning?: string }> {
   const sessionPath = getSessionPath(login);
   
-  // --- БЛОК 1: ПРОВЕРКА СЕССИИ (без изменений) ---
+  // 1. ПРОВЕРКА СОХРАНЕННОЙ СЕССИИ
   if (fs.existsSync(sessionPath)) {
-    // ... (код проверки сессии тот же, что был раньше) ...
-    // Для краткости этот блок можно оставить из предыдущего ответа, 
-    // но если хочешь полный код - скажи, я скину файл целиком.
-    // Пока предполагаем, что мы идем сразу на вход.
+    console.log('🔄 Найдена сохранённая сессия, пробуем восстановить...');
+    try {
+      const sessionData = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+      // Если сессии меньше 30 дней
+      if (Date.now() - sessionData.timestamp < 30 * 24 * 60 * 60 * 1000) {
+        await context.addCookies(sessionData.cookies);
+        
+        // Проверяем, жива ли сессия переходом в ЛК
+        await page.goto('https://my.drom.ru/personal/', { waitUntil: 'domcontentloaded', timeout: 20000 });
+        
+        try {
+            // Ждем завершения редиректов
+            await page.waitForTimeout(1000); 
+            const currentUrl = page.url();
+            
+            // Если нас не выкинуло на /sign, значит мы внутри
+            if (!currentUrl.includes('/sign')) {
+              console.log('✅ Сессия активна, вход выполнен автоматически');
+              return { success: true, needsVerification: false };
+            }
+        } catch (e) {}
+        
+        console.log('⚠️ Сессия устарела или сброшена сервером');
+        fs.unlinkSync(sessionPath); // Удаляем старую
+      }
+    } catch (e: any) {
+      console.log('⚠️ Ошибка чтения сессии:', e.message);
+    }
   }
   
-  console.log('🔐 Авторизация на Дром...');
+  // 2. ПОЛНАЯ АВТОРИЗАЦИЯ
+  console.log('🔐 Начинаем вход с паролем...');
   
   try {
     await page.goto('https://my.drom.ru/sign', { waitUntil: 'domcontentloaded' });
     
-    // Ввод логина/пароля
+    // Ввод логина
     const loginInput = page.locator('input[name="sign"]');
     await loginInput.waitFor({ state: 'visible', timeout: 10000 });
     await loginInput.fill(login);
     await page.waitForTimeout(300);
     
+    // Ввод пароля
     await page.locator('input[type="password"]').fill(password);
     await page.waitForTimeout(500);
+    
+    // Кнопка входа
     await page.click('button:has-text("Войти с паролем")');
     
-    // Ждем перехода на шаг 2
-    await page.waitForTimeout(3000); 
-
+    await page.waitForTimeout(3000); // Ждем реакции
+    
+    // 3. ПРОВЕРКА НА 2FA (SMS)
     const currentUrl = page.url();
     const bodyText = await page.innerText('body');
-    const isVerificationPage = bodyText.includes('Подтверждение') || 
-                               bodyText.includes('код') || 
-                               (currentUrl.includes('/sign') && !bodyText.includes('Войти с паролем'));
+    const isVerificationPage = bodyText.includes('Подтверждение') || bodyText.includes('код') || currentUrl.includes('/sign');
 
-    if (isVerificationPage) {
-      console.log('📱 Находимся на странице подтверждения...');
-      
-      // --- НОВАЯ ЛОГИКА: НАЖАТИЕ КНОПКИ ОТПРАВКИ ---
-      
-      // Ищем кнопки, которые могут инициировать отправку СМС
-      // Drom часто пишет "Отправить код на телефон" или просто отображает телефон как ссылку
-      const potentialButtons = [
-        page.locator('text=Отправить код'),
-        page.locator('text=телефон'),
-        page.locator('button:has-text("СМС")'),
-        page.locator('[role="button"]:has-text("код")')
-      ];
+    if (isVerificationPage && !currentUrl.includes('/personal')) {
+      console.log('📱 Требуется подтверждение по СМС');
 
-      let buttonClicked = false;
+      // Локатор для поля ввода (тот самый, который мы нашли)
+      const codeInput = page.locator('input[name="code"]');
       
-      for (const btn of potentialButtons) {
-        if (await btn.count() > 0 && await btn.first().isVisible()) {
-          console.log(`🖱️ Кликаем по кнопке: "${await btn.first().innerText()}"`);
-          try {
-            await btn.first().click();
-            buttonClicked = true;
-            // Ждем анимации появления поля ввода
-            await page.waitForTimeout(3000); 
-            break; // Если кликнули, выходим из цикла
-          } catch (e) {
-            console.log('Не удалось кликнуть, пробуем следующую...');
+      // Если поле НЕ видимо, значит нужно нажать "Отправить код"
+      if (!(await codeInput.isVisible())) {
+          console.log('🖱️ Поле ввода не видно, ищем кнопку отправки СМС...');
+          const sendButtons = [
+            page.locator('text=Отправить код'),
+            page.locator('text=телефон'),
+            page.locator('button:has-text("СМС")')
+          ];
+
+          for (const btn of sendButtons) {
+            if (await btn.count() > 0 && await btn.first().isVisible()) {
+                await btn.first().click();
+                console.log('✅ Нажата кнопка отправки кода');
+                await page.waitForTimeout(2000);
+                break;
+            }
           }
-        }
       }
 
-      if (!buttonClicked) {
-        console.log('⚠️ Кнопка отправки кода не найдена или код уже отправлен автоматически.');
+      // Если кода нет в запросе — возвращаем просьбу его ввести
+      if (!verificationCode) {
+        const timestamp = Date.now();
+        await page.screenshot({ path: path.join(DEBUG_DIR, `need_code_${timestamp}.png`) });
+        
+        return { 
+          success: false, 
+          needsVerification: true,
+          message: 'SMS отправлено. Введите полученный код в поле verificationCode',
+          debug: { screenshotUrl: `/debug/need_code_${timestamp}.png` }
+        };
       }
 
-      // --- ДИАГНОСТИКА ПОСЛЕ КЛИКА ---
-      console.log('🔍 Сбор информации о полях ввода...');
+      // 4. ВВОД КОДА
+      console.log(`✍️ Вводим код подтверждения: ${verificationCode}`);
       
-      const timestamp = Date.now();
-      
-      // 1. Скриншот (чтобы увидеть, появилось ли поле)
-      const screenshotName = `debug_after_click_${timestamp}.png`;
-      const screenshotPath = path.join(DEBUG_DIR, screenshotName);
-      await page.screenshot({ path: screenshotPath, fullPage: true });
-      
-      // 2. Сбор инпутов
-      const inputAnalysis = await page.evaluate(() => {
-        // Собираем вообще все инпуты, которые видим
-        const inputs = Array.from(document.querySelectorAll('input'));
-        return inputs.map(el => {
-          const rect = el.getBoundingClientRect();
-          const isVisible = rect.width > 0 && rect.height > 0 && el.offsetParent !== null;
-          
-          return {
-            tag: 'input',
-            outerHTML: el.outerHTML,
-            type: el.type,
-            name: el.name,
-            id: el.id,
-            placeholder: el.placeholder,
-            class: el.className,
-            isVisible: isVisible,
-            value: el.value
-          };
-        });
-      });
-      
-      console.log('📋 Найденные инпуты:', JSON.stringify(inputAnalysis, null, 2));
+      await codeInput.waitFor({ state: 'visible', timeout: 5000 });
+      await codeInput.fill(verificationCode);
+      await page.waitForTimeout(500);
 
-      return { 
-        success: false, 
-        needsVerification: true, 
-        message: buttonClicked 
-          ? 'Кнопка нажата. Проверьте debug поля.' 
-          : 'Кнопка не найдена, проверьте скриншот.',
-        debug: {
-          screenshotUrl: `/debug/${screenshotName}`,
-          foundInputs: inputAnalysis.filter((i: any) => i.isVisible), // Фильтруем только видимые
-          buttonClicked: buttonClicked
-        }
-      };
+      // Жмем подтвердить (ищем кнопку по разным текстам)
+      const confirmBtn = page.locator('button:has-text("Подтвердить"), button:has-text("Войти")').first();
+      if (await confirmBtn.isVisible()) {
+          await confirmBtn.click();
+      } else {
+          // Иногда достаточно нажать Enter
+          await page.keyboard.press('Enter');
+      }
+
+      console.log('⏳ Ждем проверки кода...');
+      // Ждем перехода в личный кабинет
+      try {
+        await page.waitForURL(url => url.toString().includes('/personal') || url.toString().includes('/messaging'), { timeout: 20000 });
+      } catch (e) {
+         console.log('⚠️ Тайм-аут перехода. Возможно, неверный код.');
+      }
     }
     
-    // Успешный вход без 2FA
-    if (currentUrl.includes('/personal') || currentUrl.includes('/messaging')) {
-        // ... сохранение кук ...
-        return { success: true, needsVerification: false };
+    // 5. ФИНАЛЬНАЯ ПРОВЕРКА И СОХРАНЕНИЕ
+    const finalUrl = page.url();
+    const isSuccess = finalUrl.includes('/personal') || finalUrl.includes('/messaging');
+    
+    if (isSuccess) {
+      console.log('🎉 Успешный вход!');
+      const cookies = await context.cookies();
+      fs.writeFileSync(sessionPath, JSON.stringify({
+        cookies: cookies,
+        timestamp: Date.now(),
+        login: login,
+        verified: true
+      }, null, 2));
+      
+      return { success: true, needsVerification: false };
     }
+    
+    // Если дошли сюда — значит вход не удался
+    const timestamp = Date.now();
+    await page.screenshot({ path: path.join(DEBUG_DIR, `fail_${timestamp}.png`) });
     
     return { 
       success: false, 
       needsVerification: false, 
-      message: 'Непонятное состояние. URL: ' + currentUrl 
+      message: 'Неверный код или ошибка сайта. URL: ' + finalUrl,
+      debug: { screenshotUrl: `/debug/fail_${timestamp}.png` }
     };
     
   } catch (error: any) {
-    console.error('❌ Ошибка:', error.message);
+    console.error('❌ Критическая ошибка:', error.message);
     throw error;
   }
 }
