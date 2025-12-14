@@ -11,6 +11,31 @@ chromium.use(StealthPlugin());
 const app = express();
 app.use(express.json());
 
+// === 🛡️ ЗАЩИТА (MIDDLEWARE) ===
+app.use((req, res, next) => {
+    // 1. Разрешаем доступ к /health без пароля (чтобы Railway знал, что мы живы)
+    if (req.path === '/health') return next();
+
+    // 2. Получаем ключ из заголовков запроса
+    const clientKey = req.headers['x-api-key'];
+    const serverKey = process.env.API_SECRET;
+
+    // 3. Если ключ на сервере не настроен — паникуем (для безопасности)
+    if (!serverKey) {
+        console.error('⛔ ОШИБКА: Переменная API_SECRET не задана в Railway!');
+        return res.status(500).json({ error: 'Server security configuration missing' });
+    }
+
+    // 4. Сравниваем ключи
+    if (clientKey !== serverKey) {
+        console.log(`⛔ Несанкционированный доступ с IP: ${req.ip}`);
+        return res.status(403).json({ error: 'Access denied: Invalid API Key' });
+    }
+
+    // 5. Если всё ок — пропускаем дальше
+    next();
+});
+
 // --- КОНФИГУРАЦИЯ ДЛЯ RAILWAY ---
 // В Railway нужно создать Volume и примонтировать его, например, в /app/data
 // Если мы локально, используем папку data в проекте
