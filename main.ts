@@ -3,7 +3,7 @@ import { chromium } from 'playwright-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import * as fs from 'fs';
 import * as path from 'path';
-import 'dotenv/config'; // Для локальной разработки
+import 'dotenv/config'; 
 
 // 1. Активируем скрытность
 chromium.use(StealthPlugin());
@@ -13,43 +13,33 @@ app.use(express.json());
 
 // === 🛡️ ЗАЩИТА (MIDDLEWARE) ===
 app.use((req, res, next) => {
-    // 1. Разрешаем доступ к /health без пароля (чтобы Railway знал, что мы живы)
     if (req.path === '/health') return next();
 
-    // 2. Получаем ключ из заголовков запроса
     const clientKey = req.headers['x-api-key'];
     const serverKey = process.env.API_SECRET;
 
-    // 3. Если ключ на сервере не настроен — паникуем (для безопасности)
     if (!serverKey) {
         console.error('⛔ ОШИБКА: Переменная API_SECRET не задана в Railway!');
         return res.status(500).json({ error: 'Server security configuration missing' });
     }
 
-    // 4. Сравниваем ключи
     if (clientKey !== serverKey) {
         console.log(`⛔ Несанкционированный доступ с IP: ${req.ip}`);
         return res.status(403).json({ error: 'Access denied: Invalid API Key' });
     }
-
-    // 5. Если всё ок — пропускаем дальше
     next();
 });
 
-// --- КОНФИГУРАЦИЯ ДЛЯ RAILWAY ---
-// В Railway нужно создать Volume и примонтировать его, например, в /app/data
-// Если мы локально, используем папку data в проекте
+// --- КОНФИГУРАЦИЯ ---
 const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || path.join(__dirname, 'data');
 const SESSIONS_DIR = path.join(DATA_DIR, 'sessions');
 const DEBUG_DIR = path.join(DATA_DIR, 'debug');
 
-// Создаем папки при старте
 if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 if (!fs.existsSync(DEBUG_DIR)) fs.mkdirSync(DEBUG_DIR, { recursive: true });
 
-// --- ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ (Proxy) ---
-// Формат PROXY_URL: http://user:pass@ip:port
-const PROXY_URL = process.env.PROXY_URL; 
+// Глобальный прокси (резервный)
+const GLOBAL_PROXY_URL = process.env.PROXY_URL; 
 
 // --- ХЕЛПЕРЫ ---
 
@@ -58,7 +48,6 @@ function getSessionPath(login: string): string {
     return path.join(SESSIONS_DIR, `state_${sanitized}.json`);
 }
 
-// Хранилище для ожидающих 2FA процессов
 interface ActiveFlow {
     browser: any;
     context: any;
@@ -78,13 +67,11 @@ function cleanupFlow(login: string) {
     }
 }
 
-// Функция "человеческого" клика
 async function humanClick(page: any, selector: string) {
     const el = page.locator(selector).first();
     if (await el.isVisible()) {
         const box = await el.boundingBox();
         if (box) {
-            // Двигаем мышь с небольшой случайностью
             await page.mouse.move(
                 box.x + box.width / 2 + (Math.random() - 0.5) * 10,
                 box.y + box.height / 2 + (Math.random() - 0.5) * 10,
@@ -100,35 +87,42 @@ async function humanClick(page: any, selector: string) {
 
 // --- ОСНОВНАЯ ЛОГИКА БРАУЗЕРА ---
 
-async function getBrowserInstance() {
+// 🛠️ FIX: Добавили аргумент customProxy
+async function getBrowserInstance(customProxy?: string) {
     const launchOptions: any = {
         headless: true,
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage', // Важно для Docker/Railway (память)
+            '--disable-dev-shm-usage',
             '--disable-gpu',
-            '--disable-blink-features=AutomationControlled' // Скрытие автоматизации
+            '--disable-blink-features=AutomationControlled'
         ]
     };
 
-    if (PROXY_URL) {
-        console.log('🌐 Используем прокси');
-        launchOptions.proxy = { server: PROXY_URL };
+    // Приоритет: Прокси из запроса -> Прокси из ENV -> Без прокси
+    const proxyToUse = customProxy || GLOBAL_PROXY_URL;
+
+    if (proxyToUse) {
+        console.log(`🌐 Используем прокси: ${proxyToUse.replace(/:[^:]*@/, ':***@')}`); // Логируем без пароля
+        launchOptions.proxy = { server: proxyToUse };
+    } else {
+        console.warn('⚠️ ВНИМАНИЕ: Запуск без прокси! (Используется IP сервера)');
     }
 
     return await chromium.launch(launchOptions);
 }
 
-async function startLoginFlow(login: string, password: string) {
+// 🛠️ FIX: Добавили аргумент proxyUrl
+async function startLoginFlow(login: string, password: string, proxyUrl?: string) {
     cleanupFlow(login);
 
-    const browser = await getBrowserInstance();
+    // Передаем прокси дальше
+    const browser = await getBrowserInstance(proxyUrl);
 
-    // Настраиваем контекст (User Agent, Locale, Timezone)
     const context = await browser.newContext({
         userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-        viewport: { width: 1366, height: 768 }, // Стандартный экран ноутбука
+        viewport: { width: 1366, height: 768 },
         locale: 'ru-RU',
         timezoneId: 'Asia/Yekaterinburg',
         ignoreHTTPSErrors: true
@@ -136,7 +130,6 @@ async function startLoginFlow(login: string, password: string) {
 
     const page = await context.newPage();
 
-    // ⚡ ОПТИМИЗАЦИЯ: Блокируем картинки, шрифты и медиа
     await page.route('**/*', (route: any) => {
         const type = route.request().resourceType();
         if (['image', 'font', 'media', 'stylesheet'].includes(type)) {
@@ -145,17 +138,14 @@ async function startLoginFlow(login: string, password: string) {
         return route.continue();
     });
 
-    // 1. Попытка восстановить сессию (Cookies + LocalStorage)
+    // 1. Попытка восстановить сессию
     const sessionPath = getSessionPath(login);
     if (fs.existsSync(sessionPath)) {
         try {
-            // Загружаем состояние хранилища
             const state = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
-            // Проверка "свежести" файла (например, не старше 30 дней)
             const stats = fs.statSync(sessionPath);
             if (Date.now() - stats.mtimeMs < 30 * 24 * 60 * 60 * 1000) {
                  await context.addCookies(state.cookies);
-                 // LocalStorage восстанавливается через initScript
                  await page.addInitScript((storage: any) => {
                     if (window.location.hostname.includes('drom.ru')) {
                         storage.forEach((item: any) => localStorage.setItem(item.name, item.value));
@@ -165,7 +155,6 @@ async function startLoginFlow(login: string, password: string) {
                  console.log(`🔄 Пробуем восстановить сессию для ${login}...`);
                  await page.goto('https://my.drom.ru/personal/', { waitUntil: 'domcontentloaded' });
                  
-                 // Проверка авторизации
                  try {
                     await page.waitForURL(/personal/, { timeout: 3000 });
                     if (!page.url().includes('sign')) {
@@ -190,10 +179,7 @@ async function startLoginFlow(login: string, password: string) {
     await page.locator('input[type="password"]').fill(password);
     await page.waitForTimeout(500);
     
-    // Клик "Войти"
     await humanClick(page, 'button:has-text("Войти с паролем")');
-    
-    // Ждем реакции сайта
     await page.waitForTimeout(3000);
 
     // 3. Проверка 2FA
@@ -213,7 +199,7 @@ async function startLoginFlow(login: string, password: string) {
         activeFlows.set(login, {
             browser, context, page,
             timestamp: Date.now(),
-            timer: setTimeout(() => cleanupFlow(login), 300 * 1000) // 5 мин ожидание
+            timer: setTimeout(() => cleanupFlow(login), 300 * 1000)
         });
 
         return { 
@@ -261,7 +247,6 @@ async function completeLoginFlow(login: string, code: string) {
 
 async function saveStateAndClose(login: string, browser: any, context: any) {
     try {
-        // Сохраняем полный state (Cookies + LocalStorage)
         const storageState = await context.storageState({ path: getSessionPath(login) });
         console.log(`💾 Сессия сохранена для ${login}`);
     } catch (e) {
@@ -272,8 +257,10 @@ async function saveStateAndClose(login: string, browser: any, context: any) {
 
 // --- РОУТЫ ---
 
+// 1. ПОЛУЧЕНИЕ СООБЩЕНИЙ
 app.post('/drom/get-messages', async (req: Request, res: Response) => {
-    const { login, password, verificationCode } = req.body;
+    // 🛠️ FIX: Извлекаем proxy из тела запроса
+    const { login, password, verificationCode, proxy } = req.body;
     if (!login || !password) return res.status(400).json({ error: 'Login/password required' });
 
     let browserData;
@@ -281,16 +268,15 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
         if (verificationCode) {
             browserData = await completeLoginFlow(login, verificationCode);
         } else {
-            const result: any = await startLoginFlow(login, password);
+            // 🛠️ FIX: Передаем proxy в функцию
+            const result: any = await startLoginFlow(login, password, proxy);
             if (result.needsVerification) return res.status(202).json(result);
             browserData = result;
         }
 
         const { page, context, browser } = browserData;
 
-        // 1. Идем к списку диалогов
         console.log('💬 Загрузка списка диалогов...');
-        // Используем goto, так как начальная точка
         await page.goto('https://my.drom.ru/personal/messaging-modal?switchPosition=dialogs', { waitUntil: 'domcontentloaded' });
         
         try {
@@ -301,7 +287,6 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
             return res.json({ success: true, count: 0, dialogs: [] });
         }
 
-        // 2. Получаем список ID (быстро)
         const dialogsList = await page.evaluate(() => {
             return Array.from(document.querySelectorAll('.dialog-list__li'))
                 .map(el => {
@@ -312,7 +297,6 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
                 .filter(Boolean);
         });
 
-        // 3. Обработка деталей (Лимит 10, чтобы не палиться)
         const limit = Math.min(dialogsList.length, 10);
         console.log(`📋 Обработка ${limit} диалогов...`);
         
@@ -321,26 +305,21 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
         for (let i = 0; i < limit; i++) {
             const dItem: any = dialogsList[i];
             try {
-                // ПОПЫТКА КЛИКА (Human Behavior)
                 const linkSelector = `a[href*="dialogId=${dItem.dialogId}"]`;
                 const clicked = await humanClick(page, linkSelector);
 
                 if (!clicked) {
-                    // Если клик не прошел (элемента нет), переходим прямо
                     await page.goto(`https://my.drom.ru/personal/messaging/view?dialogId=${dItem.dialogId}`, { waitUntil: 'domcontentloaded' });
                 }
 
-                // Ждем контент
                 await page.waitForSelector('.bzr-dialog__inner', { timeout: 5000 }).catch(() => {});
 
-                // Парсинг
                 const details = await page.evaluate(() => {
                     const carLink = document.querySelector('.bzr-dialog-header__sub-title a');
                     const carTitle = carLink?.textContent?.trim() || '';
                     let carUrl = carLink?.getAttribute('href') || '';
                     if (carUrl && carUrl.startsWith('//')) carUrl = 'https:' + carUrl;
 
-                    // Последнее ВХОДЯЩЕЕ сообщение
                     const incoming = Array.from(document.querySelectorAll('.bzr-dialog__message_in')).pop();
                     
                     return {
@@ -353,13 +332,10 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
 
                 detailedDialogs.push({ dialogId: dItem.dialogId, ...details });
 
-                // Возвращаемся назад, если кликали (чтобы сохранить состояние списка)
                 if (clicked) {
                     await page.goBack();
-                    // Рандомная пауза "на чтение заголовков"
                     await page.waitForTimeout(Math.random() * 1500 + 500);
                 } else {
-                    // Если переходили через URL, можно сразу следующий URL, но лучше паузу
                     await page.waitForTimeout(Math.random() * 1000 + 200);
                 }
 
@@ -378,14 +354,16 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
     }
 });
 
+// 2. ОТПРАВКА СООБЩЕНИЯ (В ДИАЛОГ)
 app.post('/drom/send-message', async (req: Request, res: Response) => {
-    const { login, password, dialogId, message } = req.body;
+    // 🛠️ FIX: Извлекаем proxy
+    const { login, password, dialogId, message, proxy } = req.body;
     if (!login || !password || !dialogId || !message) return res.status(400).json({ error: 'Data missing' });
 
     let browserData;
     try {
-        // Логинимся
-        const result: any = await startLoginFlow(login, password);
+        // 🛠️ FIX: Передаем proxy
+        const result: any = await startLoginFlow(login, password, proxy);
         if (result.needsVerification) return res.status(202).json(result);
         browserData = result;
         const { page, context, browser } = browserData;
@@ -396,16 +374,11 @@ app.post('/drom/send-message', async (req: Request, res: Response) => {
         const textArea = page.locator('textarea[name="message"]');
         await textArea.waitFor({ state: 'visible', timeout: 10000 });
         
-        // Имитация печати
         await textArea.focus();
-        await page.keyboard.type(message, { delay: 100 }); // Печатаем с задержкой 100мс
+        await page.keyboard.type(message, { delay: 100 }); 
 
         await page.waitForTimeout(500);
-        
-        // Клик отправить
         await humanClick(page, 'button[name="post"], button[data-action="submit-message"]');
-        
-        // Ждем подтверждения (например, исчезновения текста или перезагрузки)
         await page.waitForTimeout(2000);
 
         console.log('✅ Отправлено');
@@ -418,130 +391,87 @@ app.post('/drom/send-message', async (req: Request, res: Response) => {
         res.status(500).json({ success: false, error: err.message });
     }
 });
-// --- РОУТ 3: ПОЛУЧЕНИЕ ИЗБРАННОГО (ТОП-10) ---
 
+// 3. ПОЛУЧЕНИЕ ИЗБРАННОГО
 app.post('/drom/get-bookmarks', async (req: Request, res: Response) => {
+    // 🛠️ FIX: Извлекаем proxy
     const { login, password, verificationCode, proxy } = req.body;
-    
-    // Передаем прокси в функцию логина (если вы добавили поддержку прокси в startLoginFlow, как обсуждали ранее)
-    // Если нет, просто удалите аргумент proxy
     if (!login || !password) return res.status(400).json({ error: 'Login/pass required' });
 
     let browserData;
-
     try {
-        // 1. Логика входа (используем существующие функции)
         if (verificationCode) {
             browserData = await completeLoginFlow(login, verificationCode);
         } else {
-            // Важно: убедитесь, что startLoginFlow поддерживает прокси, если вы это внедрили
-            const result: any = await startLoginFlow(login, password); 
-            
-            if (result.needsVerification) {
-                return res.status(202).json(result);
-            }
+            // 🛠️ FIX: Передаем proxy
+            const result: any = await startLoginFlow(login, password, proxy); 
+            if (result.needsVerification) return res.status(202).json(result);
             browserData = result;
         }
 
         const { page, context, browser } = browserData;
 
         console.log('⭐ Переход в избранное...');
-        
-        // 2. Переход на страницу закладок
         await page.goto('https://my.drom.ru/personal/bookmark', { waitUntil: 'domcontentloaded' });
 
-        // 3. Ждем появления объявлений (или сообщения что пусто)
         try {
             await page.waitForSelector('.bull-item', { timeout: 8000 });
         } catch (e) {
-            console.log('Избранное пусто или не загрузилось');
+            console.log('Избранное пусто');
             await saveStateAndClose(login, browser, context);
             return res.json({ success: true, count: 0, bookmarks: [] });
         }
 
-        // 4. Парсинг данных (Top 10)
         const bookmarks = await page.evaluate(() => {
-            // Находим все карточки объявлений
             const items = Array.from(document.querySelectorAll('.bull-item'));
-            
-            // Берем только первые 10
             return items.slice(0, 10).map(el => {
-                // Вспомогательная функция для безопасного получения текста
-                const getText = (selector: string) => {
-                    const node = el.querySelector(selector);
-                    return node ? node.textContent?.trim().replace(/\s+/g, ' ') : '';
-                };
-
-                // Получение ссылки и заголовка
+                const getText = (selector: string) => el.querySelector(selector)?.textContent?.trim().replace(/\s+/g, ' ') || '';
                 const linkNode = el.querySelector('a.bulletinLink');
-                const title = linkNode ? linkNode.textContent?.trim() : '';
                 const href = linkNode ? linkNode.getAttribute('href') : '';
                 const url = href ? (href.startsWith('//') ? 'https:' + href : href) : '';
-
-                // ID объявления
                 const id = el.getAttribute('data-bulletin-id') || '';
-
-                // Цена (чистим от символов валюты и пробелов)
-                const priceRaw = getText('.price-block__price'); // "850 000 ₽"
+                const priceRaw = getText('.price-block__price');
                 const price = priceRaw ? priceRaw.replace(/[^\d]/g, '') : '';
-
-                // Город
-                const city = getText('.bull-delivery__city');
-
-                // Описание (год, двигатель, пробег и т.д.)
-                const specs = getText('.bull-item__annotation-row');
-
-                // Дата добавления/обновления
-                const date = getText('.date');
 
                 return {
                     id,
-                    title,
+                    title: linkNode?.textContent?.trim() || '',
                     url,
                     price: parseInt(price) || 0,
-                    city,
-                    specs,
-                    date
+                    city: getText('.bull-delivery__city'),
+                    specs: getText('.bull-item__annotation-row'),
+                    date: getText('.date')
                 };
             });
         });
 
-        console.log(`✅ Собрано ${bookmarks.length} объявлений из избранного`);
-
-        // 5. Сохраняем сессию и закрываем
+        console.log(`✅ Собрано ${bookmarks.length}`);
         await saveStateAndClose(login, browser, context);
-        
-        res.json({ 
-            success: true, 
-            count: bookmarks.length, 
-            bookmarks 
-        });
+        res.json({ success: true, count: bookmarks.length, bookmarks });
 
     } catch (error: any) {
-        console.error('❌ Ошибка при сборе избранного:', error.message);
+        console.error('Error bookmarks:', error.message);
         if (browserData?.browser) await browserData.browser.close().catch(() => {});
         res.status(500).json({ success: false, error: error.message });
     }
 });
-// --- РОУТ 4: НАПИСАТЬ СООБЩЕНИЕ ПРОДАВЦУ (ПЕРВОЕ КАСАНИЕ) ---
 
+// 4. ПЕРВОЕ КАСАНИЕ (ОТПРАВКА ОФФЕРА)
 app.post('/drom/send-offer', async (req: Request, res: Response) => {
-    // Принимаем url объявления и текст сообщения
+    // 🛠️ FIX: Извлекаем proxy
     const { login, password, verificationCode, proxy, url, message } = req.body;
 
     if (!login || !password || !url || !message) {
-        return res.status(400).json({ error: 'Login, password, url and message are required' });
+        return res.status(400).json({ error: 'Login, password, url and message required' });
     }
 
     let browserData;
-
     try {
-        // 1. Авторизация (стандартная процедура)
-        // Если вы добавили поддержку прокси в startLoginFlow, не забудьте передать его
         if (verificationCode) {
             browserData = await completeLoginFlow(login, verificationCode);
         } else {
-            const result: any = await startLoginFlow(login, password); // Добавьте proxy аргумент если реализовали
+            // 🛠️ FIX: Передаем proxy
+            const result: any = await startLoginFlow(login, password, proxy);
             if (result.needsVerification) return res.status(202).json(result);
             browserData = result;
         }
@@ -551,64 +481,45 @@ app.post('/drom/send-offer', async (req: Request, res: Response) => {
         console.log(`🚗 Переход к объявлению: ${url}`);
         await page.goto(url, { waitUntil: 'domcontentloaded' });
 
-        // 2. Ищем кнопку "Написать сообщение"
-        // Используем надежный селектор по атрибуту статистики
         const openModalBtnSelector = 'button[data-ga-stats-name="ask_question"]';
-        
-        // Иногда кнопка может не появиться сразу или быть скрыта (например, если это ваше объявление)
         try {
             await page.waitForSelector(openModalBtnSelector, { timeout: 10000 });
         } catch (e) {
-            throw new Error('Кнопка "Написать сообщение" не найдена. Возможно, объявление снято или это ваше авто.');
+            throw new Error('Кнопка "Написать" не найдена. Возможно, это ваше авто.');
         }
 
-        console.log('💬 Открываем модальное окно...');
+        console.log('💬 Открываем модалку...');
         await humanClick(page, openModalBtnSelector);
 
-        // 3. Ждем появления модального окна
-        // data-ftid="component_modal_content" - очень надежный селектор (используется для тестов разработчиками дрома)
         const modalSelector = 'div[data-ftid="component_modal_content"]';
         await page.waitForSelector(modalSelector, { timeout: 5000 });
 
-        // 4. Находим поле ввода и пишем текст
-        // Ищем textarea внутри модального окна. Классы типа css-h1hr4i могут меняться, поэтому берем просто тег.
         const textareaSelector = `${modalSelector} textarea`;
         await page.locator(textareaSelector).waitFor({ state: 'visible' });
         
-        // Имитируем набор текста человеком
         await page.focus(textareaSelector);
-        await page.keyboard.type(message, { delay: 100 }); // Задержка 100мс между клавишами
+        await page.keyboard.type(message, { delay: 100 });
         
         await page.waitForTimeout(Math.random() * 500 + 500);
 
-        // 5. Нажимаем кнопку "Отправить" внутри модалки
         const sendBtnSelector = 'button[data-ga-stats-name="send_question"]';
-        console.log('✉️ Отправляем сообщение...');
-        
-        // Promise.all нужен, чтобы поймать ответ сети (опционально, но полезно для отладки)
-        // В данном случае просто кликаем и ждем исчезновения модалки или уведомления
+        console.log('✉️ Отправляем...');
         await humanClick(page, sendBtnSelector);
 
-        // 6. Проверяем успешность
-        // Обычно после отправки модалка закрывается или меняется текст.
-        // Ждем 3 секунды, если ошибок нет - считаем успешным.
         await page.waitForTimeout(3000);
-        
-        // Проверка: если модалка все еще видна и кнопка активна - возможно, ошибка отправки?
-        // Но для простоты считаем, что если клик прошел без эксепшна - все ок.
 
-        console.log('✅ Сообщение отправлено!');
+        console.log('✅ Отправлено!');
         await saveStateAndClose(login, browser, context);
-
-        res.json({ success: true, message: 'Message sent successfully' });
+        res.json({ success: true });
 
     } catch (error: any) {
-        console.error('❌ Ошибка отправки оффера:', error.message);
+        console.error('Offer error:', error.message);
         if (browserData?.browser) await browserData.browser.close().catch(() => {});
         res.status(500).json({ success: false, error: error.message });
     }
 });
+
 app.get('/health', (_, res) => res.send('OK'));
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Server on port ${PORT}`));
+const PORT = Number(process.env.PORT) || 3000;
+app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server on port ${PORT}`));
