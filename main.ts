@@ -257,9 +257,8 @@ async function saveStateAndClose(login: string, browser: any, context: any) {
 
 // --- РОУТЫ ---
 
-// 1. ПОЛУЧЕНИЕ СООБЩЕНИЙ
+// 1. ПОЛУЧЕНИЕ СООБЩЕНИЙ (С БУФЕРОМ)
 app.post('/drom/get-messages', async (req: Request, res: Response) => {
-    // 🛠️ FIX: Извлекаем proxy из тела запроса
     const { login, password, verificationCode, proxy } = req.body;
     if (!login || !password) return res.status(400).json({ error: 'Login/password required' });
 
@@ -268,7 +267,6 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
         if (verificationCode) {
             browserData = await completeLoginFlow(login, verificationCode);
         } else {
-            // 🛠️ FIX: Передаем proxy в функцию
             const result: any = await startLoginFlow(login, password, proxy);
             if (result.needsVerification) return res.status(202).json(result);
             browserData = result;
@@ -314,23 +312,55 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
 
                 await page.waitForSelector('.bzr-dialog__inner', { timeout: 5000 }).catch(() => {});
 
+                // 🔥 ОБНОВЛЕННАЯ ЛОГИКА ПАРСИНГА (БУФЕР) 🔥
                 const details = await page.evaluate(() => {
                     const carLink = document.querySelector('.bzr-dialog-header__sub-title a');
                     const carTitle = carLink?.textContent?.trim() || '';
                     let carUrl = carLink?.getAttribute('href') || '';
                     if (carUrl && carUrl.startsWith('//')) carUrl = 'https:' + carUrl;
 
-                    const incoming = Array.from(document.querySelectorAll('.bzr-dialog__message_in')).pop();
+                    // Находим ВСЕ сообщения в чате
+                    const allMessages = Array.from(document.querySelectorAll('.bzr-dialog__message'));
                     
+                    const buffer: string[] = [];
+                    let lastTime = '';
+
+                    // Идем с конца (от новых к старым)
+                    for (let j = allMessages.length - 1; j >= 0; j--) {
+                        const msg = allMessages[j];
+                        
+                        // Если встретили ИСХОДЯЩЕЕ (наше) сообщение — останавливаемся
+                        if (msg.classList.contains('bzr-dialog__message_out')) {
+                            break; 
+                        }
+
+                        // Если сообщение ВХОДЯЩЕЕ — добавляем в буфер
+                        if (msg.classList.contains('bzr-dialog__message_in')) {
+                            const text = msg.querySelector('.bzr-dialog__text')?.textContent?.trim() || '';
+                            if (text) buffer.unshift(text); // Добавляем в начало массива, чтобы сохранить порядок
+                            
+                            // Запоминаем время самого последнего сообщения
+                            if (!lastTime) {
+                                lastTime = msg.querySelector('.bzr-dialog__message-dt')?.textContent?.trim() || '';
+                            }
+                        }
+                    }
+
+                    // Склеиваем сообщения через перенос строки
+                    const combinedText = buffer.join('\n');
+
                     return {
                         carTitle,
                         carUrl,
-                        lastIncomingText: incoming?.querySelector('.bzr-dialog__text')?.textContent?.trim() || '',
-                        lastIncomingTime: incoming?.querySelector('.bzr-dialog__message-dt')?.textContent?.trim() || ''
+                        lastIncomingText: combinedText, // Теперь тут "Привет\nОбмен?\nСсылка"
+                        lastIncomingTime: lastTime
                     };
                 });
 
-                detailedDialogs.push({ dialogId: dItem.dialogId, ...details });
+                // Добавляем, только если есть текст от клиента (чтобы не парсить пустые/наши диалоги)
+                if (details.lastIncomingText) {
+                    detailedDialogs.push({ dialogId: dItem.dialogId, ...details });
+                }
 
                 if (clicked) {
                     await page.goBack();
