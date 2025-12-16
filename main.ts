@@ -418,7 +418,111 @@ app.post('/drom/send-message', async (req: Request, res: Response) => {
         res.status(500).json({ success: false, error: err.message });
     }
 });
+// --- РОУТ 3: ПОЛУЧЕНИЕ ИЗБРАННОГО (ТОП-10) ---
 
+app.post('/drom/get-bookmarks', async (req: Request, res: Response) => {
+    const { login, password, verificationCode, proxy } = req.body;
+    
+    // Передаем прокси в функцию логина (если вы добавили поддержку прокси в startLoginFlow, как обсуждали ранее)
+    // Если нет, просто удалите аргумент proxy
+    if (!login || !password) return res.status(400).json({ error: 'Login/pass required' });
+
+    let browserData;
+
+    try {
+        // 1. Логика входа (используем существующие функции)
+        if (verificationCode) {
+            browserData = await completeLoginFlow(login, verificationCode);
+        } else {
+            // Важно: убедитесь, что startLoginFlow поддерживает прокси, если вы это внедрили
+            const result: any = await startLoginFlow(login, password); 
+            
+            if (result.needsVerification) {
+                return res.status(202).json(result);
+            }
+            browserData = result;
+        }
+
+        const { page, context, browser } = browserData;
+
+        console.log('⭐ Переход в избранное...');
+        
+        // 2. Переход на страницу закладок
+        await page.goto('https://my.drom.ru/personal/bookmark', { waitUntil: 'domcontentloaded' });
+
+        // 3. Ждем появления объявлений (или сообщения что пусто)
+        try {
+            await page.waitForSelector('.bull-item', { timeout: 8000 });
+        } catch (e) {
+            console.log('Избранное пусто или не загрузилось');
+            await saveStateAndClose(login, browser, context);
+            return res.json({ success: true, count: 0, bookmarks: [] });
+        }
+
+        // 4. Парсинг данных (Top 10)
+        const bookmarks = await page.evaluate(() => {
+            // Находим все карточки объявлений
+            const items = Array.from(document.querySelectorAll('.bull-item'));
+            
+            // Берем только первые 10
+            return items.slice(0, 10).map(el => {
+                // Вспомогательная функция для безопасного получения текста
+                const getText = (selector: string) => {
+                    const node = el.querySelector(selector);
+                    return node ? node.textContent?.trim().replace(/\s+/g, ' ') : '';
+                };
+
+                // Получение ссылки и заголовка
+                const linkNode = el.querySelector('a.bulletinLink');
+                const title = linkNode ? linkNode.textContent?.trim() : '';
+                const href = linkNode ? linkNode.getAttribute('href') : '';
+                const url = href ? (href.startsWith('//') ? 'https:' + href : href) : '';
+
+                // ID объявления
+                const id = el.getAttribute('data-bulletin-id') || '';
+
+                // Цена (чистим от символов валюты и пробелов)
+                const priceRaw = getText('.price-block__price'); // "850 000 ₽"
+                const price = priceRaw ? priceRaw.replace(/[^\d]/g, '') : '';
+
+                // Город
+                const city = getText('.bull-delivery__city');
+
+                // Описание (год, двигатель, пробег и т.д.)
+                const specs = getText('.bull-item__annotation-row');
+
+                // Дата добавления/обновления
+                const date = getText('.date');
+
+                return {
+                    id,
+                    title,
+                    url,
+                    price: parseInt(price) || 0,
+                    city,
+                    specs,
+                    date
+                };
+            });
+        });
+
+        console.log(`✅ Собрано ${bookmarks.length} объявлений из избранного`);
+
+        // 5. Сохраняем сессию и закрываем
+        await saveStateAndClose(login, browser, context);
+        
+        res.json({ 
+            success: true, 
+            count: bookmarks.length, 
+            bookmarks 
+        });
+
+    } catch (error: any) {
+        console.error('❌ Ошибка при сборе избранного:', error.message);
+        if (browserData?.browser) await browserData.browser.close().catch(() => {});
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
 app.get('/health', (_, res) => res.send('OK'));
 
 const PORT = process.env.PORT || 3000;
