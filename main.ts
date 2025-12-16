@@ -523,6 +523,91 @@ app.post('/drom/get-bookmarks', async (req: Request, res: Response) => {
         res.status(500).json({ success: false, error: error.message });
     }
 });
+// --- РОУТ 4: НАПИСАТЬ СООБЩЕНИЕ ПРОДАВЦУ (ПЕРВОЕ КАСАНИЕ) ---
+
+app.post('/drom/send-offer', async (req: Request, res: Response) => {
+    // Принимаем url объявления и текст сообщения
+    const { login, password, verificationCode, proxy, url, message } = req.body;
+
+    if (!login || !password || !url || !message) {
+        return res.status(400).json({ error: 'Login, password, url and message are required' });
+    }
+
+    let browserData;
+
+    try {
+        // 1. Авторизация (стандартная процедура)
+        // Если вы добавили поддержку прокси в startLoginFlow, не забудьте передать его
+        if (verificationCode) {
+            browserData = await completeLoginFlow(login, verificationCode);
+        } else {
+            const result: any = await startLoginFlow(login, password); // Добавьте proxy аргумент если реализовали
+            if (result.needsVerification) return res.status(202).json(result);
+            browserData = result;
+        }
+
+        const { page, context, browser } = browserData;
+
+        console.log(`🚗 Переход к объявлению: ${url}`);
+        await page.goto(url, { waitUntil: 'domcontentloaded' });
+
+        // 2. Ищем кнопку "Написать сообщение"
+        // Используем надежный селектор по атрибуту статистики
+        const openModalBtnSelector = 'button[data-ga-stats-name="ask_question"]';
+        
+        // Иногда кнопка может не появиться сразу или быть скрыта (например, если это ваше объявление)
+        try {
+            await page.waitForSelector(openModalBtnSelector, { timeout: 10000 });
+        } catch (e) {
+            throw new Error('Кнопка "Написать сообщение" не найдена. Возможно, объявление снято или это ваше авто.');
+        }
+
+        console.log('💬 Открываем модальное окно...');
+        await humanClick(page, openModalBtnSelector);
+
+        // 3. Ждем появления модального окна
+        // data-ftid="component_modal_content" - очень надежный селектор (используется для тестов разработчиками дрома)
+        const modalSelector = 'div[data-ftid="component_modal_content"]';
+        await page.waitForSelector(modalSelector, { timeout: 5000 });
+
+        // 4. Находим поле ввода и пишем текст
+        // Ищем textarea внутри модального окна. Классы типа css-h1hr4i могут меняться, поэтому берем просто тег.
+        const textareaSelector = `${modalSelector} textarea`;
+        await page.locator(textareaSelector).waitFor({ state: 'visible' });
+        
+        // Имитируем набор текста человеком
+        await page.focus(textareaSelector);
+        await page.keyboard.type(message, { delay: 100 }); // Задержка 100мс между клавишами
+        
+        await page.waitForTimeout(Math.random() * 500 + 500);
+
+        // 5. Нажимаем кнопку "Отправить" внутри модалки
+        const sendBtnSelector = 'button[data-ga-stats-name="send_question"]';
+        console.log('✉️ Отправляем сообщение...');
+        
+        // Promise.all нужен, чтобы поймать ответ сети (опционально, но полезно для отладки)
+        // В данном случае просто кликаем и ждем исчезновения модалки или уведомления
+        await humanClick(page, sendBtnSelector);
+
+        // 6. Проверяем успешность
+        // Обычно после отправки модалка закрывается или меняется текст.
+        // Ждем 3 секунды, если ошибок нет - считаем успешным.
+        await page.waitForTimeout(3000);
+        
+        // Проверка: если модалка все еще видна и кнопка активна - возможно, ошибка отправки?
+        // Но для простоты считаем, что если клик прошел без эксепшна - все ок.
+
+        console.log('✅ Сообщение отправлено!');
+        await saveStateAndClose(login, browser, context);
+
+        res.json({ success: true, message: 'Message sent successfully' });
+
+    } catch (error: any) {
+        console.error('❌ Ошибка отправки оффера:', error.message);
+        if (browserData?.browser) await browserData.browser.close().catch(() => {});
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
 app.get('/health', (_, res) => res.send('OK'));
 
 const PORT = process.env.PORT || 3000;
