@@ -26,4 +26,4 @@ ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable
 ENV NODE_ENV=production
 
 # Запускаем собранный JS файл напрямую
-CMD ["node", "dist/main.js"]
+CMD ["node", "start"]
