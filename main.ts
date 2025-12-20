@@ -1,13 +1,14 @@
 import express, { Request, Response } from 'express';
-import { chromium } from 'playwright-extra';
+import puppeteer from 'puppeteer-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+
 import * as fs from 'fs';
 import * as path from 'path';
 import 'dotenv/config'; 
 
 // 1. Активируем скрытность
-chromium.use(StealthPlugin());
-
+// chromium.use(StealthPlugin());
+puppeteer.use(StealthPlugin());
 const app = express();
 app.use(express.json());
 
@@ -90,14 +91,15 @@ async function humanClick(page: any, selector: string) {
 // 🛠️ FIX: Добавили аргумент customProxy
 async function getBrowserInstance(customProxy?: string) {
     const launchOptions: any = {
-        headless: true,
+        headless: "new", // Используйте новый режим headless, он меньше палится
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
-            '--disable-gpu',
-            '--disable-blink-features=AutomationControlled'
-        ]
+            // УБРАЛ '--disable-blink-features=AutomationControlled' — доверьтесь плагину
+        ],
+        // Важно: игнорируем ошибки сертификатов для прокси
+        ignoreHTTPSErrors: true 
     };
 
     // Приоритет: Прокси из запроса -> Прокси из ENV -> Без прокси
@@ -110,7 +112,7 @@ async function getBrowserInstance(customProxy?: string) {
         console.warn('⚠️ ВНИМАНИЕ: Запуск без прокси! (Используется IP сервера)');
     }
 
-    return await chromium.launch(launchOptions);
+    return await puppeteer.launch(launchOptions); 
 }
 
 // 🛠️ FIX: Добавили аргумент proxyUrl
@@ -169,7 +171,7 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
 
     // 2. Вход с паролем
     console.log('🔐 Входим по логину/паролю...');
-    await page.goto('https://my.drom.ru/sign', { waitUntil: 'domcontentloaded' });
+    await page.goto('https://my.drom.ru/sign', { waitUntil: 'domcontentloaded',timeout: 60000 });
 
     const loginInput = page.locator('input[name="sign"]');
     await loginInput.waitFor({ state: 'visible', timeout: 10000 });
