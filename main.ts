@@ -106,8 +106,8 @@ async function getBrowserInstance(customProxy?: string) {
             '--window-size=1366,768'
         ],
         ignoreHTTPSErrors: true,
-        // Важно для Docker образа Puppeteer
-       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || puppeteer.executablePath(),
+        // Если переменная есть — берем её. Если нет — пусть ищет сам (fallback)
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH 
     };
 
     // Приоритет: Прокси из запроса -> Прокси из ENV -> Без прокси
