@@ -94,9 +94,23 @@ async function humanClick(page: any, selector: string) {
     return false;
 }
 
+// Хелпер для парсинга прокси
+function parseProxy(proxyUrl: string) {
+    try {
+        const url = new URL(proxyUrl);
+        return {
+            server: `${url.protocol}//${url.hostname}:${url.port}`,
+            username: url.username,
+            password: url.password
+        };
+    } catch (e) {
+        return null;
+    }
+}
+
 // --- ОСНОВНАЯ ЛОГИКА БРАУЗЕРА ---
 
-async function getBrowserInstance(customProxy?: string) {
+async function getBrowserInstance(proxyServer?: string) {
     const launchOptions: any = {
         headless: "new",
         args: [
@@ -106,33 +120,43 @@ async function getBrowserInstance(customProxy?: string) {
             '--window-size=1366,768'
         ],
         ignoreHTTPSErrors: true,
-        // Если переменная есть — берем её. Если нет — пусть ищет сам (fallback)
-        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH 
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH
     };
 
-    // Приоритет: Прокси из запроса -> Прокси из ENV -> Без прокси
-    const proxyToUse = customProxy || GLOBAL_PROXY_URL;
-
-    if (proxyToUse) {
-        console.log(`🌐 Используем прокси: ${proxyToUse.replace(/:[^:]*@/, ':***@')}`); 
-        launchOptions.args.push(`--proxy-server=${proxyToUse}`);
-    } else {
-        console.warn('⚠️ ВНИМАНИЕ: Запуск без прокси! (Используется IP сервера)');
+    if (proxyServer) {
+        launchOptions.args.push(`--proxy-server=${proxyServer}`);
     }
 
     return await puppeteer.launch(launchOptions);
 }
 
 async function startLoginFlow(login: string, password: string, proxyUrl?: string) {
-    await cleanupFlow(login); // Clean explicit wait
+    await cleanupFlow(login);
 
-    const browser = await getBrowserInstance(proxyUrl);
-    // Puppeteer: Создаем изолированный контекст (Incognito)
-    // В Puppeteer для этого используется createBrowserContext, но часто проще использовать дефолтный, если мы закрываем браузер
-    // Однако для надежности кук - лучше инкогнито, если сохраняем стейт
-    // Но drom может не любить инкогнито. Давайте используем стандартную страницу, так как браузер создается на 1 сессию.
-    
+    let proxyConfig = null;
+    let proxyServerArg = undefined;
+
+    // Парсим прокси
+    const proxyToUse = proxyUrl || GLOBAL_PROXY_URL;
+    if (proxyToUse) {
+        proxyConfig = parseProxy(proxyToUse);
+        if (proxyConfig) {
+            proxyServerArg = proxyConfig.server; // Только http://ip:port
+            console.log(`🌐 Прокси: ${proxyServerArg}`);
+        }
+    }
+
+    const browser = await getBrowserInstance(proxyServerArg);
     const page = await browser.newPage();
+
+    // ВАЖНО: Авторизация на прокси
+    if (proxyConfig && proxyConfig.username && proxyConfig.password) {
+        console.log('🔑 Авторизация на прокси...');
+        await page.authenticate({
+            username: proxyConfig.username,
+            password: proxyConfig.password
+        });
+    }
     
     await page.setViewport({ width: 1366, height: 768 });
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36');
