@@ -206,7 +206,7 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
 
         // Ищем кнопку "Войти с паролем"
         // Puppeteer не имеет псевдо-селекторов :has-text, используем xpath или evaluate
-        const [button] = await page.$x("//button[contains(., 'Войти с паролем')]");
+        const [button] = await page.$$("xpath/.//button[contains(., 'Войти с паролем')]");
         if (button) {
             await button.click();
         } else {
@@ -235,7 +235,7 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
         console.log('📱 Drom запрашивает код подтверждения');
         
         // Поиск кнопки отправить код (если она есть)
-        const [sendBtn] = await page.$x("//div[contains(text(), 'Отправить код')] | //button[contains(text(), 'Отправить код')]");
+        const [sendBtn] = await page.$$("xpath/.//div[contains(text(), 'Отправить код')] | //button[contains(text(), 'Отправить код')]");
         if (sendBtn) {
             await sendBtn.click();
             console.log('SMS запрошена');
@@ -273,7 +273,7 @@ async function completeLoginFlow(login: string, code: string) {
         await new Promise(r => setTimeout(r, Math.random() * 500 + 200));
 
         // Нажимаем подтвердить
-        const [confirmBtn] = await page.$x("//button[contains(., 'Подтвердить') or contains(., 'Войти')]");
+        const [confirmBtn] = await page.$$("xpath/.//button[contains(., 'Подтвердить') or contains(., 'Войти')]");
         if (confirmBtn) {
             await confirmBtn.click();
         } else {
