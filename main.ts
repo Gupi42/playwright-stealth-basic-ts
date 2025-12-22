@@ -326,29 +326,59 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
     const { login, password, verificationCode, proxy } = req.body;
     if (!login || !password) return res.status(400).json({ error: 'Login/password required' });
 
-    let browserData;
+    let browserData: any;
+    const timestamp = Date.now();
+    const makeDebugUrl = (name: string) => `${req.protocol}://${req.get('host')}/screenshots/${name}`;
+
     try {
+        console.log(`[Debug] [${login}] Начинаем получение сообщений...`);
+
+        // 1. Авторизация
         if (verificationCode) {
+            console.log(`[Debug] [${login}] Завершаем вход по коду...`);
             browserData = await completeLoginFlow(login, verificationCode);
         } else {
+            console.log(`[Debug] [${login}] Запускаем стандартный вход...`);
             const result: any = await startLoginFlow(login, password, proxy);
-            if (result.needsVerification) return res.status(202).json(result);
+            if (result.needsVerification) {
+                console.log(`[Debug] [${login}] Требуется 2FA код`);
+                return res.status(202).json(result);
+            }
             browserData = result;
         }
 
         const { page, browser } = browserData;
-        console.log('💬 Загрузка списка диалогов...');
-        
-        await page.goto('https://my.drom.ru/personal/messaging-modal?switchPosition=dialogs', { waitUntil: 'domcontentloaded', timeout: 60000 });
 
+        // 2. Переход к списку диалогов
+        console.log(`[Debug] [${login}] Переход к списку диалогов...`);
+        await page.goto('https://my.drom.ru/personal/messaging-modal?switchPosition=dialogs', { 
+            waitUntil: 'networkidle2', 
+            timeout: 60000 
+        });
+
+        // Скриншот списка диалогов
+        const listImgName = `list_${login}_${timestamp}.png`;
+        await page.screenshot({ path: path.join(DEBUG_DIR, listImgName), fullPage: true });
+        console.log(`[Debug] [${login}] Скриншот списка сохранен: ${makeDebugUrl(listImgName)}`);
+
+        // 3. Ожидание списка
         try {
-            await page.waitForSelector('.dialog-list__li', { timeout: 10000 });
-        } catch {
-            console.log('Диалогов нет');
+            await page.waitForSelector('.dialog-list__li', { timeout: 15000 });
+            console.log(`[Debug] [${login}] Селектор .dialog-list__li найден`);
+        } catch (e) {
+            console.log(`[Debug] [${login}] Диалогов не найдено или страница не прогрузилась`);
+            const emptyImgName = `empty_${login}_${timestamp}.png`;
+            await page.screenshot({ path: path.join(DEBUG_DIR, emptyImgName) });
             await saveStateAndClose(login, browser, page);
-            return res.json({ success: true, count: 0, dialogs: [] });
+            return res.json({ 
+                success: true, 
+                count: 0, 
+                dialogs: [], 
+                debug_screenshot: makeDebugUrl(emptyImgName) 
+            });
         }
 
+        // 4. Парсинг ID диалогов
         const dialogsList = await page.evaluate(() => {
             return Array.from(document.querySelectorAll('.dialog-list__li'))
                 .map(el => {
@@ -359,19 +389,22 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
                 .filter(Boolean);
         });
 
+        console.log(`[Debug] [${login}] Найдено ID диалогов: ${dialogsList.length}`);
+
         const limit = Math.min(dialogsList.length, 10);
-        console.log(`📋 Обработка ${limit} диалогов...`);
         const detailedDialogs = [];
 
+        // 5. Цикл по деталям диалогов
         for (let i = 0; i < limit; i++) {
             const dItem: any = dialogsList[i];
             try {
-                // В Puppeteer сложнее кликнуть по конкретному элементу из списка, проще перейти по URL
-                await page.goto(`https://my.drom.ru/personal/messaging/view?dialogId=${dItem.dialogId}`, { waitUntil: 'domcontentloaded' });
+                console.log(`[Debug] [${login}] Парсим диалог ${dItem.dialogId} (${i + 1}/${limit})...`);
+                await page.goto(`https://my.drom.ru/personal/messaging/view?dialogId=${dItem.dialogId}`, { 
+                    waitUntil: 'networkidle2',
+                    timeout: 30000 
+                });
                 
-                try {
-                     await page.waitForSelector('.bzr-dialog__inner', { timeout: 8000 });
-                } catch(e) { continue; }
+                await page.waitForSelector('.bzr-dialog__inner', { timeout: 10000 });
 
                 const details = await page.evaluate(() => {
                     const carLink = document.querySelector('.bzr-dialog-header__sub-title a');
@@ -385,9 +418,8 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
 
                     for (let j = allMessages.length - 1; j >= 0; j--) {
                         const msg = allMessages[j];
-                        if (msg.classList.contains('bzr-dialog__message_out')) {
-                            break;
-                        }
+                        if (msg.classList.contains('bzr-dialog__message_out')) break;
+                        
                         if (msg.classList.contains('bzr-dialog__message_in')) {
                             const text = msg.querySelector('.bzr-dialog__text')?.textContent?.trim() || '';
                             if (text) buffer.unshift(text);
@@ -397,11 +429,10 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
                         }
                     }
 
-                    const combinedText = buffer.join('\n');
                     return {
                         carTitle,
                         carUrl,
-                        lastIncomingText: combinedText,
+                        lastIncomingText: buffer.join('\n'),
                         lastIncomingTime: lastTime
                     };
                 });
@@ -410,24 +441,39 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
                     detailedDialogs.push({ dialogId: dItem.dialogId, ...details });
                 }
 
-                await new Promise(r => setTimeout(r, Math.random() * 1000 + 500));
+                // Небольшая задержка между диалогами
+                await new Promise(r => setTimeout(r, 1000));
 
-            } catch (e) {
-                console.error(`Error dialog ${dItem.dialogId}`, e);
+            } catch (e: any) {
+                console.error(`[Error] Ошибка парсинга диалога ${dItem.dialogId}:`, e.message);
             }
         }
 
-        console.log(`✅ Собрано ${detailedDialogs.length}`);
+        console.log(`[Debug] [${login}] Сбор завершен. Успешно: ${detailedDialogs.length}`);
         await saveStateAndClose(login, browser, page);
-        res.json({ success: true, count: detailedDialogs.length, dialogs: detailedDialogs });
+        
+        res.json({ 
+            success: true, 
+            count: detailedDialogs.length, 
+            dialogs: detailedDialogs,
+            debug_screenshot: makeDebugUrl(listImgName)
+        });
 
     } catch (err: any) {
-        console.error('CRITICAL ERROR:', err.message);
+        console.error('[CRITICAL ERROR]:', err.message);
+        const errImgName = `critical_err_${login}_${timestamp}.png`;
+        if (browserData?.page) {
+            await browserData.page.screenshot({ path: path.join(DEBUG_DIR, errImgName) }).catch(() => {});
+        }
         if (browserData?.browser) await browserData.browser.close().catch(() => {});
-        res.status(500).json({ success: false, error: err.message });
+        
+        res.status(500).json({ 
+            success: false, 
+            error: err.message, 
+            debug_screenshot: makeDebugUrl(errImgName) 
+        });
     }
 });
-
 // 2. ОТПРАВКА СООБЩЕНИЯ
 app.post('/drom/send-message', async (req: Request, res: Response) => {
     const { login, password, dialogId, message, proxy } = req.body;
