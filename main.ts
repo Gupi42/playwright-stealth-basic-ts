@@ -146,52 +146,42 @@ app.post('/drom/get-bookmarks', async (req: Request, res: Response) => {
     const { login, password, proxy } = req.body;
     const { browser, page, cursor } = await getBrowserAndPage('drom', login, proxy);
     
+    // Генерируем имя файла заранее
+    const screenshotName = `debug_bookmarks_${login}_${Date.now()}.png`;
+    const screenshotPath = path.join(DEBUG_DIR, screenshotName);
+
     try {
-        console.log(`[Debug] Переход в закладки для пользователя: ${login}`);
+        console.log(`[Debug] Переход в закладки для: ${login}`);
         
-        // Используем networkidle2, чтобы дождаться загрузки всех AJAX-запросов списка
+        // Переходим и ждем, пока сетевая активность почти утихнет
         await page.goto('https://my.drom.ru/personal/bookmark', { 
             waitUntil: 'networkidle2', 
             timeout: 60000 
         });
 
-        const currentUrl = page.url();
-        console.log(`[Debug] Текущий URL после загрузки: ${currentUrl}`);
-
-        // Сохраняем скриншот для визуальной проверки
-        const screenshotPath = path.join(DEBUG_DIR, `debug_bookmarks_${login}_${Date.now()}.png`);
+        // 1. Делаем скриншот сразу после загрузки
         await page.screenshot({ path: screenshotPath, fullPage: true });
-        const fileName = path.basename(screenshotPath);
-        // Формируем публичную ссылку (подставь свой домен если он не определяется автоматически)
-        const publicUrl = `${req.protocol}://${req.get('host')}/screenshots/${fileName}`;
+        
+        const currentUrl = page.url();
+        const host = req.get('host');
+        const publicUrl = `${req.protocol}://${host}/screenshots/${screenshotName}`;
+        
+        console.log(`[Debug] Скриншот сделан: ${publicUrl}`);
 
-        console.log(`[Debug] Скриншот доступен по ссылке: ${publicUrl}`);
-
-        // Проверка: не выкинуло ли нас на страницу авторизации?
+        // 2. Проверяем, не выкинуло ли на логин
         if (currentUrl.includes('sign')) {
-            console.error('[Debug] ОШИБКА: Сессия неактивна, Drom просит логин.');
+            console.error('[Debug] ОШИБКА: Редирект на страницу входа.');
             await browser.close();
             return res.status(401).json({ 
                 success: false, 
-                error: 'Session expired or redirect to login',
-                url: currentUrl,
-                screenshot: publicUrl
+                error: 'Not authorized (Redirected to login)',
+                screenshot: publicUrl 
             });
         }
 
-        // Ждем селектор и логируем его наличие
-        const itemsFound = await page.evaluate(() => document.querySelectorAll('.bull-item').length);
-        console.log(`[Debug] Найдено элементов .bull-item в DOM: ${itemsFound}`);
-
-        if (itemsFound === 0) {
-            // Если элементов нет, возможно, страница пустая или селектор сменился.
-            // Проверим наличие альтернативного селектора
-            const altItems = await page.evaluate(() => document.querySelectorAll('[data-bulletin-id]').length);
-            console.log(`[Debug] Найдено элементов [data-bulletin-id]: ${altItems}`);
-        }
-
-        await page.waitForSelector('.bull-item', { timeout: 10000 }).catch(() => {
-            console.log('[Debug] Таймаут: селектор .bull-item не появился.');
+        // 3. Проверяем наличие элементов
+        await page.waitForSelector('.bull-item', { timeout: 8000 }).catch(() => {
+            console.log('[Debug] Селектор .bull-item не найден за 8 секунд');
         });
 
         const bookmarks = await page.evaluate(() => {
@@ -200,35 +190,49 @@ app.post('/drom/get-bookmarks', async (req: Request, res: Response) => {
                 const titleEl = el.querySelector('a.bulletinLink');
                 const priceEl = el.querySelector('.price-block__price');
                 const specEl = el.querySelector('.bull-item__annotation-row');
+                const cityEl = el.querySelector('.bull-delivery__city');
                 
                 return {
                     id: el.getAttribute('data-bulletin-id'),
-                    title: titleEl?.textContent?.trim() || 'No title',
-                    url: titleEl?.getAttribute('href') || 'No url',
+                    title: titleEl?.textContent?.trim() || 'N/A',
+                    url: titleEl?.getAttribute('href') || 'N/A',
                     price: parseInt(priceEl?.textContent?.replace(/\D/g, '') || '0'),
-                    specs: specEl?.textContent?.trim() || 'No specs'
+                    specs: specEl?.textContent?.trim() || 'N/A',
+                    city: cityEl?.textContent?.trim() || 'N/A'
                 };
             });
         });
 
-        console.log(`[Debug] Успешно распаршено закладок: ${bookmarks.length}`);
+        console.log(`[Debug] Найдено закладок: ${bookmarks.length}`);
 
+        // Закрываем браузер и сохраняем сессию
         await saveStateAndClose('drom', login, browser, page);
+
+        // Отправляем ответ с кликабельной ссылкой на скриншот
         res.json({ 
             success: true, 
             count: bookmarks.length, 
-            debug: { url: currentUrl, screenshot: screenshotPath },
+            debug: {
+                currentUrl,
+                screenshot: publicUrl
+            },
             bookmarks 
         });
 
     } catch (e: any) {
-        console.error(`[Debug] Критическая ошибка в get-bookmarks: ${e.message}`);
-        // Скриншот при ошибке
-        const errorScreenshot = path.join(DEBUG_DIR, `error_bookmarks_${Date.now()}.png`);
-        await page.screenshot({ path: errorScreenshot }).catch(() => {});
+        console.error(`[Debug] Ошибка: ${e.message}`);
         
-        await browser.close().catch(() => {});
-        res.status(500).json({ error: e.message, screenshot: errorScreenshot });
+        // В случае ошибки тоже пытаемся сделать скриншот
+        await page.screenshot({ path: screenshotPath }).catch(() => {});
+        const publicUrl = `${req.protocol}://${req.get('host')}/screenshots/${screenshotName}`;
+
+        if (browser) await browser.close().catch(() => {});
+        
+        res.status(500).json({ 
+            success: false, 
+            error: e.message, 
+            screenshot: publicUrl 
+        });
     }
 });
 
