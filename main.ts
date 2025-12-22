@@ -14,6 +14,7 @@ const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 puppeteer.use(StealthPlugin());
 const app = express();
 app.use(express.json());
+app.use('/screenshots', express.static(DEBUG_DIR));
 
 const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || path.join(__dirname, 'data');
 const SESSIONS_DIR = path.join(DATA_DIR, 'sessions');
