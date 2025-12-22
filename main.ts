@@ -49,6 +49,7 @@ function getSessionPath(login: string): string {
     const sanitized = login.replace(/[^a-zA-Z0-9]/g, '_');
     return path.join(SESSIONS_DIR, `state_${sanitized}.json`);
 }
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 interface ActiveFlow {
     browser: any;
