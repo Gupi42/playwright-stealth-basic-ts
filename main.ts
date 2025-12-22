@@ -3,330 +3,609 @@ import express, { Request, Response } from 'express';
 import puppeteer from 'puppeteer-extra';
 // @ts-ignore
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
-import { createCursor, GhostCursor } from 'ghost-cursor';
 import * as fs from 'fs';
 import * as path from 'path';
 import 'dotenv/config';
 
-// 1. СНАЧАЛА ОБЪЯВЛЯЕМ ПУТИ
+// 1. Активируем скрытность
+puppeteer.use(StealthPlugin());
+
+const app = express();
+app.use(express.json());
+
+// === 🛡️ ЗАЩИТА (MIDDLEWARE) ===
+app.use((req, res, next) => {
+    if (req.path === '/health') return next();
+
+    const clientKey = req.headers['x-api-key'];
+    const serverKey = process.env.API_SECRET;
+
+    if (!serverKey) {
+        console.error('⛔ ОШИБКА: Переменная API_SECRET не задана в Railway!');
+        return res.status(500).json({ error: 'Server security configuration missing' });
+    }
+
+    if (clientKey !== serverKey) {
+        console.log(`⛔ Несанкционированный доступ с IP: ${req.ip}`);
+        return res.status(403).json({ error: 'Access denied: Invalid API Key' });
+    }
+    next();
+});
+
+// --- КОНФИГУРАЦИЯ ---
 const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || path.join(__dirname, 'data');
 const SESSIONS_DIR = path.join(DATA_DIR, 'sessions');
 const DEBUG_DIR = path.join(DATA_DIR, 'debug');
 
-// Создаем папки, если их нет
-[SESSIONS_DIR, DEBUG_DIR].forEach(dir => {
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-});
+if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+if (!fs.existsSync(DEBUG_DIR)) fs.mkdirSync(DEBUG_DIR, { recursive: true });
 
-// 2. ЗАТЕМ ИНИЦИАЛИЗИРУЕМ EXPRESS
-const app = express();
-app.use(express.json());
+// Глобальный прокси (резервный)
+const GLOBAL_PROXY_URL = process.env.PROXY_URL;
 
-// Теперь DEBUG_DIR уже объявлен, и ошибки не будет
-app.use('/screenshots', express.static(DEBUG_DIR));
-
-// Активируем скрытность
-puppeteer.use(StealthPlugin());
-
-// Хелпер для ожидания
-const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+// --- ХЕЛПЕРЫ ---
+function getSessionPath(login: string): string {
+    const sanitized = login.replace(/[^a-zA-Z0-9]/g, '_');
+    return path.join(SESSIONS_DIR, `state_${sanitized}.json`);
+}
 
 interface ActiveFlow {
     browser: any;
     page: any;
-    cursor: GhostCursor;
+    timestamp: number;
     timer: NodeJS.Timeout;
 }
+
 const activeFlows: Map<string, ActiveFlow> = new Map();
-
-function parseProxy(proxyUrl?: string) {
-    if (!proxyUrl) return null;
-    try {
-        const u = new URL(proxyUrl);
-        return { server: `${u.protocol}//${u.hostname}:${u.port}`, username: u.username, password: u.password };
-    } catch { return null; }
-}
-
-const getSessionPath = (service: string, login: string) => 
-    path.join(SESSIONS_DIR, `${service}_${login.replace(/[^a-z0-9]/gi, '_')}.json`);
 
 async function cleanupFlow(login: string) {
     const flow = activeFlows.get(login);
     if (flow) {
+        console.log(`🧹 Очистка ресурсов для ${login}`);
         clearTimeout(flow.timer);
-        await flow.browser.close().catch(() => {});
+        try {
+            await flow.browser.close();
+        } catch (e) {}
         activeFlows.delete(login);
     }
 }
 
-async function getBrowserAndPage(service: string, login: string, proxyUrl?: string) {
-    const proxyConfig = parseProxy(proxyUrl || process.env.PROXY_URL);
-    const args = ['--no-sandbox', '--disable-setuid-sandbox', '--window-size=1366,768', '--disable-blink-features=AutomationControlled'];
-    if (proxyConfig?.server) args.push(`--proxy-server=${proxyConfig.server}`);
-
-    const browser = await puppeteer.launch({ 
-        headless: true, // Исправлено: "new" заменен на true
-        args, 
-        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH 
-    });
-    const page = await browser.newPage();
-    const cursor = await createCursor(page);
-
-    if (proxyConfig?.username) await page.authenticate({ username: proxyConfig.username, password: proxyConfig.password });
-    
-    await page.setViewport({ width: 1366, height: 768 });
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
-
-    await page.setRequestInterception(true);
-    page.on('request', (req: any) => {
-        if (['image', 'font', 'media'].includes(req.resourceType())) req.abort();
-        else req.continue();
-    });
-
-    const sessionPath = getSessionPath(service, login);
-    if (fs.existsSync(sessionPath)) {
-        const state = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
-        if (Date.now() - state.ts < 1000 * 60 * 60 * 24 * 14) {
-            await page.setCookie(...state.cookies);
-            await page.evaluateOnNewDocument((s: any) => {
-                s.forEach((item: any) => localStorage.setItem(item.name, item.value));
-            }, state.localStorage);
-        }
-    }
-    return { browser, page, cursor };
-}
-
-async function saveStateAndClose(service: string, login: string, browser: any, page: any) {
+async function humanClick(page: any, selector: string) {
     try {
-        const cookies = await page.cookies();
-        const localStorageData = await page.evaluate(() => Object.keys(localStorage).map(k => ({ name: k, value: localStorage.getItem(k) })));
-        fs.writeFileSync(getSessionPath(service, login), JSON.stringify({ cookies, localStorage: localStorageData, ts: Date.now() }));
-    } finally { await browser.close().catch(() => {}); }
-}
-
-app.use((req, res, next) => {
-    if (req.path === '/health') return next();
-    if (req.headers['x-api-key'] !== process.env.API_SECRET) return res.status(403).json({ error: 'Forbidden' });
-    next();
-});
-
-app.post('/drom/get-messages', async (req: Request, res: Response) => {
-    const { login, password, proxy } = req.body;
-    const { browser, page, cursor } = await getBrowserAndPage('drom', login, proxy);
-    try {
-        await page.goto('https://my.drom.ru/personal/messaging', { waitUntil: 'domcontentloaded' });
-        if (page.url().includes('sign')) {
-            await page.type('input[name="sign"]', login, { delay: 50 });
-            await page.type('input[type="password"]', password, { delay: 50 });
-            await cursor.click('button[type="submit"]');
-            await delay(3000); // Заменено page.waitForTimeout
-            if (await page.$('input[name="code"]')) {
-                activeFlows.set(login, { browser, page, cursor, timer: setTimeout(() => cleanupFlow(login), 300000) });
-                return res.status(202).json({ needsVerification: true });
+        await page.waitForSelector(selector, { visible: true, timeout: 5000 });
+        const element = await page.$(selector);
+        
+        if (element) {
+            const box = await element.boundingBox();
+            if (box) {
+                await page.mouse.move(
+                    box.x + box.width / 2 + (Math.random() - 0.5) * 10,
+                    box.y + box.height / 2 + (Math.random() - 0.5) * 10,
+                    { steps: 10 }
+                );
+                await new Promise(r => setTimeout(r, Math.random() * 200 + 100));
+                await element.click();
+                return true;
             }
         }
-        await page.waitForSelector('.dialog-list__li', { timeout: 10000 }).catch(() => {});
-        const dialogIds = await page.evaluate(() => Array.from(document.querySelectorAll('.dialog-list__li')).map(el => el.querySelector('a[href*="dialogId="]')?.getAttribute('href')?.match(/dialogId=([^&]+)/)?.[1]).filter(Boolean));
-        
-        const detailedDialogs = [];
-        for (const id of dialogIds.slice(0, 10)) {
-            await page.goto(`https://my.drom.ru/personal/messaging/view?dialogId=${id}`, { waitUntil: 'domcontentloaded' });
-            const details = await page.evaluate(() => {
-                const msgs = Array.from(document.querySelectorAll('.bzr-dialog__message'));
-                let lastIn = '', lastOut = '', lastTime = '';
-                for (let i = msgs.length - 1; i >= 0; i--) {
-                    const text = msgs[i].querySelector('.bzr-dialog__text')?.textContent?.trim() || '';
-                    if (msgs[i].classList.contains('bzr-dialog__message_in') && !lastIn) { lastIn = text; lastTime = msgs[i].querySelector('.bzr-dialog__message-dt')?.textContent?.trim() || ''; }
-                    if (msgs[i].classList.contains('bzr-dialog__message_out') && !lastOut) { lastOut = text; }
-                }
-                const link = document.querySelector('.bzr-dialog-header__sub-title a');
-                return { carTitle: link?.textContent?.trim(), carUrl: link?.getAttribute('href'), lastIncomingText: lastIn, lastIncomingTime: lastTime, lastOutgoingText: lastOut };
-            });
-            detailedDialogs.push({ dialogId: id, ...details });
-        }
-        await saveStateAndClose('drom', login, browser, page);
-        res.json({ success: true, dialogs: detailedDialogs });
-    } catch (e: any) { await browser.close(); res.status(500).json({ error: e.message }); }
-});
+    } catch (e) {
+        // Element not found or not visible
+    }
+    return false;
+}
 
-app.post('/drom/get-bookmarks', async (req: Request, res: Response) => {
-    const { login, password, proxy } = req.body;
-    const { browser, page, cursor } = await getBrowserAndPage('drom', login, proxy);
+// Хелпер для парсинга прокси
+function parseProxy(proxyUrl: string) {
+    try {
+        const url = new URL(proxyUrl);
+        return {
+            server: `${url.protocol}//${url.hostname}:${url.port}`,
+            username: url.username,
+            password: url.password
+        };
+    } catch (e) {
+        return null;
+    }
+}
+
+// --- ОСНОВНАЯ ЛОГИКА БРАУЗЕРА ---
+
+async function getBrowserInstance(proxyServer?: string) {
+    const launchOptions: any = {
+        headless: "new",
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--window-size=1366,768'
+        ],
+        ignoreHTTPSErrors: true,
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH
+    };
+
+    if (proxyServer) {
+        launchOptions.args.push(`--proxy-server=${proxyServer}`);
+    }
+
+    return await puppeteer.launch(launchOptions);
+}
+
+async function startLoginFlow(login: string, password: string, proxyUrl?: string) {
+    await cleanupFlow(login);
+
+    let proxyConfig = null;
+    let proxyServerArg = undefined;
+
+    // Парсим прокси
+    const proxyToUse = proxyUrl || GLOBAL_PROXY_URL;
+    if (proxyToUse) {
+        proxyConfig = parseProxy(proxyToUse);
+        if (proxyConfig) {
+            proxyServerArg = proxyConfig.server; // Только http://ip:port
+            console.log(`🌐 Прокси: ${proxyServerArg}`);
+        }
+    }
+
+    const browser = await getBrowserInstance(proxyServerArg);
+    const page = await browser.newPage();
+
+    // ВАЖНО: Авторизация на прокси
+    if (proxyConfig && proxyConfig.username && proxyConfig.password) {
+        console.log('🔑 Авторизация на прокси...');
+        await page.authenticate({
+            username: proxyConfig.username,
+            password: proxyConfig.password
+        });
+    }
     
-    // Генерируем имя файла заранее
-    const screenshotName = `debug_bookmarks_${login}_${Date.now()}.png`;
-    const screenshotPath = path.join(DEBUG_DIR, screenshotName);
+    await page.setViewport({ width: 1366, height: 768 });
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36');
+
+    // Блокировка ресурсов
+    await page.setRequestInterception(true);
+    page.on('request', (req: any) => {
+        const type = req.resourceType();
+        if (['image', 'font', 'media', 'stylesheet'].includes(type)) {
+            req.abort();
+        } else {
+            req.continue();
+        }
+    });
+
+    // 1. Попытка восстановить сессию
+    const sessionPath = getSessionPath(login);
+    if (fs.existsSync(sessionPath)) {
+        try {
+            const state = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+            const stats = fs.statSync(sessionPath);
+
+            // Сессия моложе 30 дней
+            if (Date.now() - stats.mtimeMs < 30 * 24 * 60 * 60 * 1000) {
+                if (state.cookies && Array.isArray(state.cookies)) {
+                    await page.setCookie(...state.cookies);
+                }
+                
+                // LocalStorage restore logic if needed (complex in puppeteer without context)
+                // Puppeteer не имеет метода addInitScript как Playwright в явном виде для контекста,
+                // но можно использовать evaluateOnNewDocument
+                if (state.localStorage) {
+                     await page.evaluateOnNewDocument((data: any) => {
+                        localStorage.clear();
+                        data.forEach((item: any) => localStorage.setItem(item.name, item.value));
+                    }, state.localStorage);
+                }
+
+                console.log(`🔄 Пробуем восстановить сессию для ${login}...`);
+                
+                try {
+                   await page.goto('https://my.drom.ru/personal/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+                   
+                   // Проверка, не выкинуло ли на логин
+                   if (!page.url().includes('sign')) {
+                        console.log('✅ Сессия восстановлена');
+                        return { success: true, browser, page };
+                   }
+                } catch(e) {
+                   console.log('⚠️ Ошибка при переходе с куками:', e);
+                }
+            }
+            console.log('⚠️ Сессия устарела или невалидна, нужен ре-логин');
+        } catch (e) { 
+            console.error('Ошибка чтения сессии', e); 
+        }
+    }
+
+    // 2. Вход с паролем
+    console.log('🔐 Входим по логину/паролю...');
+    await page.goto('https://my.drom.ru/sign', { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+    const loginInputSelector = 'input[name="sign"]';
+    try {
+        await page.waitForSelector(loginInputSelector, { visible: true, timeout: 15000 });
+        await page.type(loginInputSelector, login, { delay: 100 });
+        await new Promise(r => setTimeout(r, 300));
+        
+        await page.type('input[type="password"]', password, { delay: 100 });
+        await new Promise(r => setTimeout(r, 500));
+
+        // Ищем кнопку "Войти с паролем"
+        // Puppeteer не имеет псевдо-селекторов :has-text, используем xpath или evaluate
+        const [button] = await page.$$("xpath/.//button[contains(., 'Войти с паролем')]");
+        if (button) {
+            await button.click();
+        } else {
+             // Fallback если текст другой
+             await page.click('button[type="submit"]');
+        }
+
+        await new Promise(r => setTimeout(r, 3000));
+        
+    } catch (e) {
+        console.error("Ошибка при вводе логина:", e);
+        await browser.close();
+        throw e;
+    }
+
+    // 3. Проверка 2FA
+    const currentUrl = page.url();
+    // const bodyText = await page.$eval('body', (el:any) => el.innerText); 
+    // ^ это может быть долго, проще проверить наличие элементов
+    
+    // Проверяем наличие поля ввода кода
+    const codeInput = await page.$('input[name="code"]');
+    
+    if (codeInput || currentUrl.includes('/sign')) { 
+        // Если мы все еще на /sign и есть намек на код
+        console.log('📱 Drom запрашивает код подтверждения');
+        
+        // Поиск кнопки отправить код (если она есть)
+        const [sendBtn] = await page.$$("xpath/.//div[contains(text(), 'Отправить код')] | //button[contains(text(), 'Отправить код')]");
+        if (sendBtn) {
+            await sendBtn.click();
+            console.log('SMS запрошена');
+        }
+
+        activeFlows.set(login, {
+            browser, 
+            page,
+            timestamp: Date.now(),
+            timer: setTimeout(() => cleanupFlow(login), 300 * 1000)
+        });
+
+        return {
+            success: false,
+            needsVerification: true,
+            message: 'Требуется код подтверждения. Отправьте его в следующем запросе.'
+        };
+    }
+
+    return { success: true, browser, page };
+}
+
+async function completeLoginFlow(login: string, code: string) {
+    const flow = activeFlows.get(login);
+    if (!flow) throw new Error('Сессия не найдена или истекла. Повторите запрос.');
+
+    console.log(`✍️ Вводим код для ${login}...`);
+    const { page } = flow;
 
     try {
-        console.log(`[Debug] Переход в закладки для: ${login}`);
+        const codeInputSelector = 'input[name="code"]';
+        await page.waitForSelector(codeInputSelector, { visible: true, timeout: 5000 });
+        await page.type(codeInputSelector, code, { delay: 100 });
         
-        // Переходим и ждем, пока сетевая активность почти утихнет
-        await page.goto('https://my.drom.ru/personal/bookmark', { 
-            waitUntil: 'networkidle2', 
-            timeout: 60000 
-        });
+        await new Promise(r => setTimeout(r, Math.random() * 500 + 200));
 
-        // 1. Делаем скриншот сразу после загрузки
-        await page.screenshot({ path: screenshotPath, fullPage: true });
-        
-        const currentUrl = page.url();
-        const host = req.get('host');
-        const publicUrl = `${req.protocol}://${host}/screenshots/${screenshotName}`;
-        
-        console.log(`[Debug] Скриншот сделан: ${publicUrl}`);
-
-        // 2. Проверяем, не выкинуло ли на логин
-        if (currentUrl.includes('sign')) {
-            console.error('[Debug] ОШИБКА: Редирект на страницу входа.');
-            await browser.close();
-            return res.status(401).json({ 
-                success: false, 
-                error: 'Not authorized (Redirected to login)',
-                screenshot: publicUrl 
-            });
+        // Нажимаем подтвердить
+        const [confirmBtn] = await page.$$("xpath/.//button[contains(., 'Подтвердить') or contains(., 'Войти')]");
+        if (confirmBtn) {
+            await confirmBtn.click();
+        } else {
+            await page.keyboard.press('Enter');
         }
 
-        // 3. Проверяем наличие элементов
-        await page.waitForSelector('.bull-item', { timeout: 8000 }).catch(() => {
-            console.log('[Debug] Селектор .bull-item не найден за 8 секунд');
+        // Ждем перехода
+        await page.waitForFunction(() => window.location.href.includes('/personal'), { timeout: 15000 });
+
+        console.log('🎉 Успешный вход!');
+        clearTimeout(flow.timer);
+        activeFlows.delete(login);
+
+        return { success: true, browser: flow.browser, page: flow.page };
+
+    } catch (error) {
+        await page.screenshot({ path: path.join(DEBUG_DIR, `error_code_${Date.now()}.png`) });
+        throw new Error('Неверный код или ошибка сайта');
+    }
+}
+
+async function saveStateAndClose(login: string, browser: any, page: any) {
+    try {
+        const cookies = await page.cookies();
+        const localStorageData = await page.evaluate(() => {
+            const data: any[] = [];
+            for (let i = 0; i < localStorage.length; i++) {
+                const key = localStorage.key(i);
+                if (key) data.push({ name: key, value: localStorage.getItem(key) });
+            }
+            return data;
         });
+
+        const state = { cookies, localStorage: localStorageData };
+        fs.writeFileSync(getSessionPath(login), JSON.stringify(state, null, 2));
+        console.log(`💾 Сессия сохранена для ${login}`);
+    } catch (e) {
+        console.error('Ошибка сохранения сессии:', e);
+    } finally {
+        await browser.close().catch(() => {});
+    }
+}
+
+// --- РОУТЫ ---
+
+// 1. ПОЛУЧЕНИЕ СООБЩЕНИЙ
+app.post('/drom/get-messages', async (req: Request, res: Response) => {
+    const { login, password, verificationCode, proxy } = req.body;
+    if (!login || !password) return res.status(400).json({ error: 'Login/password required' });
+
+    let browserData;
+    try {
+        if (verificationCode) {
+            browserData = await completeLoginFlow(login, verificationCode);
+        } else {
+            const result: any = await startLoginFlow(login, password, proxy);
+            if (result.needsVerification) return res.status(202).json(result);
+            browserData = result;
+        }
+
+        const { page, browser } = browserData;
+        console.log('💬 Загрузка списка диалогов...');
+        
+        await page.goto('https://my.drom.ru/personal/messaging-modal?switchPosition=dialogs', { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+        try {
+            await page.waitForSelector('.dialog-list__li', { timeout: 10000 });
+        } catch {
+            console.log('Диалогов нет');
+            await saveStateAndClose(login, browser, page);
+            return res.json({ success: true, count: 0, dialogs: [] });
+        }
+
+        const dialogsList = await page.evaluate(() => {
+            return Array.from(document.querySelectorAll('.dialog-list__li'))
+                .map(el => {
+                    const href = el.querySelector('a[href*="/messaging/view"]')?.getAttribute('href');
+                    const match = href?.match(/dialogId=([^&]+)/);
+                    return match ? { dialogId: match[1] } : null;
+                })
+                .filter(Boolean);
+        });
+
+        const limit = Math.min(dialogsList.length, 10);
+        console.log(`📋 Обработка ${limit} диалогов...`);
+        const detailedDialogs = [];
+
+        for (let i = 0; i < limit; i++) {
+            const dItem: any = dialogsList[i];
+            try {
+                // В Puppeteer сложнее кликнуть по конкретному элементу из списка, проще перейти по URL
+                await page.goto(`https://my.drom.ru/personal/messaging/view?dialogId=${dItem.dialogId}`, { waitUntil: 'domcontentloaded' });
+                
+                try {
+                     await page.waitForSelector('.bzr-dialog__inner', { timeout: 8000 });
+                } catch(e) { continue; }
+
+                const details = await page.evaluate(() => {
+                    const carLink = document.querySelector('.bzr-dialog-header__sub-title a');
+                    const carTitle = carLink?.textContent?.trim() || '';
+                    let carUrl = carLink?.getAttribute('href') || '';
+                    if (carUrl && carUrl.startsWith('//')) carUrl = 'https:' + carUrl;
+
+                    const allMessages = Array.from(document.querySelectorAll('.bzr-dialog__message'));
+                    const buffer: string[] = [];
+                    let lastTime = '';
+
+                    for (let j = allMessages.length - 1; j >= 0; j--) {
+                        const msg = allMessages[j];
+                        if (msg.classList.contains('bzr-dialog__message_out')) {
+                            break;
+                        }
+                        if (msg.classList.contains('bzr-dialog__message_in')) {
+                            const text = msg.querySelector('.bzr-dialog__text')?.textContent?.trim() || '';
+                            if (text) buffer.unshift(text);
+                            if (!lastTime) {
+                                lastTime = msg.querySelector('.bzr-dialog__message-dt')?.textContent?.trim() || '';
+                            }
+                        }
+                    }
+
+                    const combinedText = buffer.join('\n');
+                    return {
+                        carTitle,
+                        carUrl,
+                        lastIncomingText: combinedText,
+                        lastIncomingTime: lastTime
+                    };
+                });
+
+                if (details.lastIncomingText) {
+                    detailedDialogs.push({ dialogId: dItem.dialogId, ...details });
+                }
+
+                await new Promise(r => setTimeout(r, Math.random() * 1000 + 500));
+
+            } catch (e) {
+                console.error(`Error dialog ${dItem.dialogId}`, e);
+            }
+        }
+
+        console.log(`✅ Собрано ${detailedDialogs.length}`);
+        await saveStateAndClose(login, browser, page);
+        res.json({ success: true, count: detailedDialogs.length, dialogs: detailedDialogs });
+
+    } catch (err: any) {
+        console.error('CRITICAL ERROR:', err.message);
+        if (browserData?.browser) await browserData.browser.close().catch(() => {});
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+// 2. ОТПРАВКА СООБЩЕНИЯ
+app.post('/drom/send-message', async (req: Request, res: Response) => {
+    const { login, password, dialogId, message, proxy } = req.body;
+    if (!login || !password || !dialogId || !message) return res.status(400).json({ error: 'Data missing' });
+
+    let browserData;
+    try {
+        const result: any = await startLoginFlow(login, password, proxy);
+        if (result.needsVerification) return res.status(202).json(result);
+        browserData = result;
+
+        const { page, browser } = browserData;
+        console.log(`📤 Отправка в диалог ${dialogId}...`);
+        
+        await page.goto(`https://my.drom.ru/personal/messaging/view?dialogId=${dialogId}`, { waitUntil: 'domcontentloaded' });
+
+        const textAreaSelector = 'textarea[name="message"]';
+        await page.waitForSelector(textAreaSelector, { visible: true, timeout: 10000 });
+        await page.type(textAreaSelector, message, { delay: 100 });
+        
+        await new Promise(r => setTimeout(r, 500));
+        await page.click('button[name="post"]');
+        
+        await new Promise(r => setTimeout(r, 2000));
+        console.log('✅ Отправлено');
+        
+        await saveStateAndClose(login, browser, page);
+        res.json({ success: true });
+
+    } catch (err: any) {
+        console.error('Send error:', err.message);
+        if (browserData?.browser) await browserData.browser.close().catch(() => {});
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+// 3. ПОЛУЧЕНИЕ ИЗБРАННОГО
+app.post('/drom/get-bookmarks', async (req: Request, res: Response) => {
+    const { login, password, verificationCode, proxy } = req.body;
+    if (!login || !password) return res.status(400).json({ error: 'Login/pass required' });
+
+    let browserData;
+    try {
+        if (verificationCode) {
+            browserData = await completeLoginFlow(login, verificationCode);
+        } else {
+            const result: any = await startLoginFlow(login, password, proxy);
+            if (result.needsVerification) return res.status(202).json(result);
+            browserData = result;
+        }
+
+        const { page, browser } = browserData;
+        console.log('⭐ Переход в избранное...');
+        await page.goto('https://my.drom.ru/personal/bookmark', { waitUntil: 'domcontentloaded' });
+
+        try {
+            await page.waitForSelector('.bull-item', { timeout: 8000 });
+        } catch (e) {
+            console.log('Избранное пусто');
+            await saveStateAndClose(login, browser, page);
+            return res.json({ success: true, count: 0, bookmarks: [] });
+        }
 
         const bookmarks = await page.evaluate(() => {
             const items = Array.from(document.querySelectorAll('.bull-item'));
             return items.slice(0, 10).map(el => {
-                const titleEl = el.querySelector('a.bulletinLink');
-                const priceEl = el.querySelector('.price-block__price');
-                const specEl = el.querySelector('.bull-item__annotation-row');
-                const cityEl = el.querySelector('.bull-delivery__city');
-                
+                const getText = (selector: string) => el.querySelector(selector)?.textContent?.trim().replace(/\s+/g, ' ') || '';
+                const linkNode = el.querySelector('a.bulletinLink');
+                const href = linkNode ? linkNode.getAttribute('href') : '';
+                const url = href ? (href.startsWith('//') ? 'https:' + href : href) : '';
+                const id = el.getAttribute('data-bulletin-id') || '';
+                const priceRaw = getText('.price-block__price');
+                const price = priceRaw ? priceRaw.replace(/[^\d]/g, '') : '';
+
                 return {
-                    id: el.getAttribute('data-bulletin-id'),
-                    title: titleEl?.textContent?.trim() || 'N/A',
-                    url: titleEl?.getAttribute('href') || 'N/A',
-                    price: parseInt(priceEl?.textContent?.replace(/\D/g, '') || '0'),
-                    specs: specEl?.textContent?.trim() || 'N/A',
-                    city: cityEl?.textContent?.trim() || 'N/A'
+                    id,
+                    title: linkNode?.textContent?.trim() || '',
+                    url,
+                    price: parseInt(price) || 0,
+                    city: getText('.bull-delivery__city'),
+                    specs: getText('.bull-item__annotation-row'),
+                    date: getText('.date')
                 };
             });
         });
 
-        console.log(`[Debug] Найдено закладок: ${bookmarks.length}`);
+        console.log(`✅ Собрано ${bookmarks.length}`);
+        await saveStateAndClose(login, browser, page);
+        res.json({ success: true, count: bookmarks.length, bookmarks });
 
-        // Закрываем браузер и сохраняем сессию
-        await saveStateAndClose('drom', login, browser, page);
-
-        // Отправляем ответ с кликабельной ссылкой на скриншот
-        res.json({ 
-            success: true, 
-            count: bookmarks.length, 
-            debug: {
-                currentUrl,
-                screenshot: publicUrl
-            },
-            bookmarks 
-        });
-
-    } catch (e: any) {
-        console.error(`[Debug] Ошибка: ${e.message}`);
-        
-        // В случае ошибки тоже пытаемся сделать скриншот
-        await page.screenshot({ path: screenshotPath }).catch(() => {});
-        const publicUrl = `${req.protocol}://${req.get('host')}/screenshots/${screenshotName}`;
-
-        if (browser) await browser.close().catch(() => {});
-        
-        res.status(500).json({ 
-            success: false, 
-            error: e.message, 
-            screenshot: publicUrl 
-        });
+    } catch (error: any) {
+        console.error('Error bookmarks:', error.message);
+        if (browserData?.browser) await browserData.browser.close().catch(() => {});
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
+// 4. ОТПРАВКА ОФФЕРА
 app.post('/drom/send-offer', async (req: Request, res: Response) => {
-    const { login, password, url, message, proxy } = req.body;
-    const { browser, page, cursor } = await getBrowserAndPage('drom', login, proxy);
-    try {
-        await page.goto(url, { waitUntil: 'domcontentloaded' });
-        const btn = 'button[data-ga-stats-name="ask_question"]';
-        await page.waitForSelector(btn, { visible: true, timeout: 10000 });
-        await cursor.click(btn);
-        await page.waitForSelector('textarea', { visible: true });
-        await page.type('textarea', message, { delay: 50 });
-        await cursor.click('button[data-ga-stats-name="send_question"]');
-        await delay(3000); // Заменено page.waitForTimeout
-        await saveStateAndClose('drom', login, browser, page);
-        res.json({ success: true });
-    } catch (e: any) { await browser.close(); res.status(500).json({ error: e.message }); }
-});
+    const { login, password, verificationCode, proxy, url, message } = req.body;
+    if (!login || !password || !url || !message) {
+        return res.status(400).json({ error: 'Login, password, url and message required' });
+    }
 
-app.post('/drom/send-message', async (req: Request, res: Response) => {
-    const { login, password, dialogId, message, proxy } = req.body;
-    const { browser, page, cursor } = await getBrowserAndPage('drom', login, proxy);
+    let browserData;
     try {
-        await page.goto(`https://my.drom.ru/personal/messaging/view?dialogId=${dialogId}`, { waitUntil: 'domcontentloaded' });
-        await page.waitForSelector('textarea[name="message"]', { visible: true });
-        await page.type('textarea[name="message"]', message, { delay: 30 });
-        await cursor.click('button[name="post"]');
-        await delay(2000); // Заменено page.waitForTimeout
-        await saveStateAndClose('drom', login, browser, page);
-        res.json({ success: true });
-    } catch (e: any) { await browser.close(); res.status(500).json({ error: e.message }); }
-});
-
-app.post('/avito/login', async (req: Request, res: Response) => {
-    const { login, password, proxy } = req.body;
-    const { browser, page, cursor } = await getBrowserAndPage('avito', login, proxy);
-    try {
-        await page.goto('https://www.avito.ru/#login', { waitUntil: 'domcontentloaded' });
-        await page.waitForSelector('input[data-marker="login-form/login/input"]', { timeout: 10000 });
-        await page.type('input[data-marker="login-form/login/input"]', login, { delay: 60 });
-        await page.type('input[data-marker="login-form/password/input"]', password, { delay: 60 });
-        await cursor.click('button[data-marker="login-form/submit"]');
-        await delay(5000); // Заменено page.waitForTimeout
-        if (await page.$('[data-marker="phone-confirm-wrapper"]')) {
-            activeFlows.set(login, { browser, page, cursor, timer: setTimeout(() => cleanupFlow(login), 300000) });
-            return res.status(202).json({ needsVerification: true });
-        }
-        await saveStateAndClose('avito', login, browser, page);
-        res.json({ success: true });
-    } catch (e: any) { await browser.close(); res.status(500).json({ error: e.message }); }
-});
-app.post('/auth/reset', async (req: Request, res: Response) => {
-    const { login, service } = req.body;
-    const sessionPath = getSessionPath(service, login);
-    
-    try {
-        if (fs.existsSync(sessionPath)) {
-            fs.unlinkSync(sessionPath);
-            console.log(`🗑️ Сессия для ${login} удалена вручную.`);
-            res.json({ success: true, message: 'Session deleted. Now call login route.' });
+        if (verificationCode) {
+            browserData = await completeLoginFlow(login, verificationCode);
         } else {
-            res.json({ success: false, message: 'Session file not found.' });
+            const result: any = await startLoginFlow(login, password, proxy);
+            if (result.needsVerification) return res.status(202).json(result);
+            browserData = result;
         }
-    } catch (e: any) {
-        res.status(500).json({ error: e.message });
+
+        const { page, browser } = browserData;
+        console.log(`🚗 Переход к объявлению: ${url}`);
+        
+        await page.goto(url, { waitUntil: 'domcontentloaded' });
+        
+        // Кнопка "Написать"
+        const openModalBtnSelector = 'button[data-ga-stats-name="ask_question"]';
+        try {
+            await humanClick(page, openModalBtnSelector);
+        } catch(e) {
+             throw new Error('Кнопка "Написать" не найдена');
+        }
+
+        const modalSelector = 'div[data-ftid="component_modal_content"]';
+        await page.waitForSelector(modalSelector, { visible: true, timeout: 5000 });
+        
+        const textareaSelector = `${modalSelector} textarea`;
+        await page.waitForSelector(textareaSelector, { visible: true });
+        await page.type(textareaSelector, message, { delay: 100 });
+        
+        await new Promise(r => setTimeout(r, 1000));
+        
+        const sendBtnSelector = 'button[data-ga-stats-name="send_question"]';
+        console.log('✉️ Отправляем...');
+        await humanClick(page, sendBtnSelector);
+        
+        await new Promise(r => setTimeout(r, 3000));
+        console.log('✅ Отправлено!');
+        
+        await saveStateAndClose(login, browser, page);
+        res.json({ success: true });
+
+    } catch (error: any) {
+        console.error('Offer error:', error.message);
+        if (browserData?.browser) await browserData.browser.close().catch(() => {});
+        res.status(500).json({ success: false, error: error.message });
     }
 });
-app.post('/verify-code', async (req: Request, res: Response) => {
-    const { login, code, service } = req.body;
-    const flow = activeFlows.get(login);
-    if (!flow) return res.status(404).json({ error: 'Flow not found' });
-    try {
-        const { page, cursor, browser } = flow;
-        if (service === 'avito') {
-            await page.type('input[data-marker="phone-confirm/code-input/input"]', code, { delay: 100 });
-            await cursor.click('button[data-marker="phone-confirm/confirm"]');
-        } else {
-            await page.type('input[name="code"]', code, { delay: 100 });
-            await page.keyboard.press('Enter');
-        }
-        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
-        await saveStateAndClose(service, login, browser, page);
-        activeFlows.delete(login);
-        res.json({ success: true });
-    } catch (e: any) { await cleanupFlow(login); res.status(500).json({ error: e.message }); }
-});
+
+
 
 app.get('/health', (_, res) => res.send('OK'));
-app.listen(Number(process.env.PORT) || 3000, '0.0.0.0', () => console.log(`🚀 Server ready`));
+
+const PORT = Number(process.env.PORT) || 3000;
+app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server on port ${PORT}`));
