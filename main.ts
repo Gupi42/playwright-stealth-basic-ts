@@ -130,8 +130,6 @@ async function getBrowserInstance(proxyServer?: string) {
     return await puppeteer.launch(launchOptions);
 }
 
-// --- ОБНОВЛЕННАЯ ФУНКЦИЯ ВХОДА ---
-
 async function startLoginFlow(login, password, proxyUrl) {
     await cleanupFlow(login);
 
@@ -256,73 +254,6 @@ async function startLoginFlow(login, password, proxyUrl) {
             success: false,
             needsVerification: true,
             message: 'Требуется код подтверждения.'
-        };
-    }
-
-    return { success: true, browser, page };
-}
-
-    // 2. Вход с паролем
-    console.log('🔐 Входим по логину/паролю...');
-    await page.goto('https://my.drom.ru/sign', { waitUntil: 'domcontentloaded', timeout: 60000 });
-
-    const loginInputSelector = 'input[name="sign"]';
-    try {
-        await page.waitForSelector(loginInputSelector, { visible: true, timeout: 15000 });
-        await page.type(loginInputSelector, login, { delay: 100 });
-        await new Promise(r => setTimeout(r, 300));
-        
-        await page.type('input[type="password"]', password, { delay: 100 });
-        await new Promise(r => setTimeout(r, 500));
-
-        // Ищем кнопку "Войти с паролем"
-        // Puppeteer не имеет псевдо-селекторов :has-text, используем xpath или evaluate
-        const [button] = await page.$$("xpath/.//button[contains(., 'Войти с паролем')]");
-        if (button) {
-            await button.click();
-        } else {
-             // Fallback если текст другой
-             await page.click('button[type="submit"]');
-        }
-
-        await new Promise(r => setTimeout(r, 3000));
-        
-    } catch (e) {
-        console.error("Ошибка при вводе логина:", e);
-        await browser.close();
-        throw e;
-    }
-
-    // 3. Проверка 2FA
-    const currentUrl = page.url();
-    // const bodyText = await page.$eval('body', (el:any) => el.innerText); 
-    // ^ это может быть долго, проще проверить наличие элементов
-    
-    // Проверяем наличие поля ввода кода
-    const codeInput = await page.$('input[name="code"]');
-    
-    if (codeInput || currentUrl.includes('/sign')) { 
-        // Если мы все еще на /sign и есть намек на код
-        console.log('📱 Drom запрашивает код подтверждения');
-        
-        // Поиск кнопки отправить код (если она есть)
-        const [sendBtn] = await page.$$("xpath/.//div[contains(text(), 'Отправить код')] | //button[contains(text(), 'Отправить код')]");
-        if (sendBtn) {
-            await sendBtn.click();
-            console.log('SMS запрошена');
-        }
-
-        activeFlows.set(login, {
-            browser, 
-            page,
-            timestamp: Date.now(),
-            timer: setTimeout(() => cleanupFlow(login), 300 * 1000)
-        });
-
-        return {
-            success: false,
-            needsVerification: true,
-            message: 'Требуется код подтверждения. Отправьте его в следующем запросе.'
         };
     }
 
