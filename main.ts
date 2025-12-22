@@ -356,6 +356,80 @@ async function saveStateAndClose(login: string, browser: any, page: any) {
 }
 
 // --- РОУТЫ ---
+app.post('/drom/my-screenshot', async (req: Request, res: Response) => {
+    const { login, password, proxy } = req.body;
+    if (!login || !password) return res.status(400).json({ error: 'Login/password required' });
+
+    let browserData: any;
+    const timestamp = Date.now();
+    const screenshotName = `my_page_${login}_${timestamp}.png`;
+    const screenshotPath = path.join(DEBUG_DIR, screenshotName);
+    
+    // Хелпер для формирования ссылки
+    const makeDebugUrl = (name: string) => `${req.protocol}://${req.get('host')}/screenshots/${name}`;
+
+    try {
+        console.log(`[Debug] [${login}] Запрос скриншота личного кабинета...`);
+
+        // Инициируем вход (подхватит сессию или запросит код)
+        const result: any = await startLoginFlow(login, password, proxy);
+        
+        if (result.needsVerification) {
+            console.log(`[Debug] [${login}] Для скриншота требуется СМС-код`);
+            return res.status(202).json(result);
+        }
+
+        browserData = result;
+        const { page, browser } = browserData;
+
+        console.log(`[Debug] [${login}] Переход на https://www.drom.ru/my/`);
+        
+        // Переходим на целевую страницу
+        await page.goto('https://www.drom.ru/my/', { 
+            waitUntil: 'networkidle2', 
+            timeout: 60000 
+        });
+
+        // Небольшая пауза, чтобы прогрузились все виджеты личного кабинета
+        await delay(2000);
+
+        // Делаем скриншот всей страницы
+        await page.screenshot({ 
+            path: screenshotPath, 
+            fullPage: true 
+        });
+
+        console.log(`[Debug] [${login}] Скриншот готов: ${screenshotName}`);
+
+        // Сохраняем состояние и закрываем браузер
+        await saveStateAndClose(login, browser, page);
+
+        res.json({ 
+            success: true, 
+            url: 'https://www.drom.ru/my/',
+            screenshot_url: makeDebugUrl(screenshotName) 
+        });
+
+    } catch (e: any) {
+        console.error(`[Debug] Ошибка при создании скриншота: ${e.message}`);
+        
+        // Попытка сделать скриншот ошибки
+        let errUrl = '';
+        if (browserData?.page) {
+            const errName = `error_my_${login}_${timestamp}.png`;
+            await browserData.page.screenshot({ path: path.join(DEBUG_DIR, errName) }).catch(() => {});
+            errUrl = makeDebugUrl(errName);
+        }
+
+        if (browserData?.browser) await browserData.browser.close().catch(() => {});
+        
+        res.status(500).json({ 
+            success: false, 
+            error: e.message, 
+            error_screenshot: errUrl 
+        });
+    }
+});
 app.post('/drom/logout', async (req: Request, res: Response) => {
     const { login, proxy } = req.body;
     if (!login) return res.status(400).json({ error: 'Login required' });
