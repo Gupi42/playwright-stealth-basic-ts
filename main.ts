@@ -131,82 +131,81 @@ async function getBrowserInstance(proxyServer?: string) {
     return await puppeteer.launch(launchOptions);
 }
 
-async function startLoginFlow(login, password, proxyUrl) {
+async function startLoginFlow(login: string, password: string, proxyUrl?: string) {
     await cleanupFlow(login);
 
     let proxyConfig = null;
     let proxyServerArg = undefined;
-
     const proxyToUse = proxyUrl || GLOBAL_PROXY_URL;
     if (proxyToUse) {
         proxyConfig = parseProxy(proxyToUse);
-        if (proxyConfig) {
-            proxyServerArg = proxyConfig.server;
-            console.log(`🌐 Прокси: ${proxyServerArg}`);
-        }
+        if (proxyConfig) proxyServerArg = proxyConfig.server;
     }
 
     const browser = await getBrowserInstance(proxyServerArg);
     const page = await browser.newPage();
 
-    if (proxyConfig && proxyConfig.username && proxyConfig.password) {
-        await page.authenticate({
-            username: proxyConfig.username,
-            password: proxyConfig.password
-        });
+    if (proxyConfig?.username) {
+        await page.authenticate({ username: proxyConfig.username, password: proxyConfig.password });
     }
     
     await page.setViewport({ width: 1366, height: 768 });
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36');
 
-    // Блокировка тяжелых ресурсов
+    // === ШАГ 0: ГЛУБОКАЯ ОЧИСТКА ===
+    console.log(`[${login}] Выполняем логаут и очистку данных...`);
+    try {
+        // 1. Прямой переход на логаут (быстрее чем искать кнопку)
+        await page.goto('https://my.drom.ru/logout', { waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
+        
+        // 2. Очистка через системные команды Chrome
+        const client = await page.target().createCDPSession();
+        await client.send('Network.clearBrowserCookies');
+        await client.send('Network.clearBrowserCache');
+        
+        // 3. Очистка локального хранилища
+        await page.goto('https://my.drom.ru/', { waitUntil: 'domcontentloaded' });
+        await page.evaluate(() => {
+            localStorage.clear();
+            sessionStorage.clear();
+        });
+    } catch (e) {
+        console.log('Ошибка при логауте (возможно, уже разлогинен)');
+    }
+
+    // Блокировка ресурсов
     await page.setRequestInterception(true);
-    page.on('request', (req) => {
-        if (['image', 'font', 'media', 'stylesheet'].includes(req.resourceType())) {
-            req.abort();
-        } else {
-            req.continue();
-        }
+    page.on('request', (req: any) => {
+        if (['image', 'font', 'media', 'stylesheet'].includes(req.resourceType())) req.abort();
+        else req.continue();
     });
 
-    // === ПРИНУДИТЕЛЬНАЯ ОЧИСТКА ПЕРЕД ВХОДОМ ===
-    const client = await page.target().createCDPSession();
-    await client.send('Network.clearBrowserCookies');
-    await client.send('Network.clearBrowserCache');
-
-    // 1. Попытка восстановить сессию
+    // 1. Попытка восстановить сессию именно для этого логина
     const sessionPath = getSessionPath(login);
     if (fs.existsSync(sessionPath)) {
         try {
             const state = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
-            const stats = fs.statSync(sessionPath);
-
-            if (Date.now() - stats.mtimeMs < 30 * 24 * 60 * 60 * 1000) {
-                if (state.cookies) await page.setCookie(...state.cookies);
-                
-                // localStorage восстанавливаем через специальный скрипт перед переходом
-                if (state.localStorage) {
-                    await page.evaluateOnNewDocument((data) => {
-                        localStorage.clear();
-                        data.forEach((item) => localStorage.setItem(item.name, item.value));
-                    }, state.localStorage);
-                }
-
-                console.log(`🔄 Пробуем восстановить сессию для ${login}...`);
-                await page.goto('https://my.drom.ru/personal/', { waitUntil: 'networkidle2', timeout: 60000 });
-                
-                if (!page.url().includes('sign')) {
-                    console.log('✅ Сессия восстановлена');
-                    return { success: true, browser, page };
-                }
+            if (state.cookies) await page.setCookie(...state.cookies);
+            if (state.localStorage) {
+                // Восстанавливаем localStorage перед заходом
+                await page.evaluateOnNewDocument((data: any) => {
+                    localStorage.clear();
+                    data.forEach((item: any) => localStorage.setItem(item.name, item.value));
+                }, state.localStorage);
             }
-        } catch (e) { 
-            console.error('Ошибка сессии:', e.message); 
-        }
+
+            console.log(`🔄 Пробуем восстановить сессию для ${login}...`);
+            await page.goto('https://my.drom.ru/personal/', { waitUntil: 'networkidle2', timeout: 60000 });
+            
+            if (!page.url().includes('sign')) {
+                console.log('✅ Сессия восстановлена');
+                return { success: true, browser, page };
+            }
+        } catch (e) { console.log('Сессия не подошла'); }
     }
 
-    // 2. Вход с паролем
-    console.log(`🔐 Входим в аккаунт ${login}...`);
+    // 2. Если сессии нет — идем на логин
+    console.log(`🔐 Входим по паролю в аккаунт: ${login}`);
     await page.goto('https://my.drom.ru/sign', { waitUntil: 'networkidle2', timeout: 60000 });
 
     try {
@@ -214,9 +213,10 @@ async function startLoginFlow(login, password, proxyUrl) {
         await page.type('input[name="sign"]', login, { delay: 100 });
         await page.type('input[type="password"]', password, { delay: 100 });
 
+        // Ищем кнопку "Войти с паролем"
         const [button] = await page.$$("xpath/.//button[contains(., 'Войти с паролем')]");
         
-        // Ждем навигации ПОСЛЕ клика, чтобы не потерять контекст
+        // Используем Promise.all для предотвращения ошибки "Execution context destroyed"
         if (button) {
             await Promise.all([
                 page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {}),
@@ -228,9 +228,11 @@ async function startLoginFlow(login, password, proxyUrl) {
                 page.click('button[type="submit"]')
             ]);
         }
-
-    } catch (e) {
-        console.error("Ошибка при вводе данных:", e.message);
+        
+        await delay(3000); // Даем время на обработку редиректов
+        
+    } catch (e: any) {
+        console.error("Ошибка ввода данных:", e.message);
         await browser.close();
         throw e;
     }
@@ -238,16 +240,9 @@ async function startLoginFlow(login, password, proxyUrl) {
     // 3. Проверка 2FA
     const codeInput = await page.$('input[name="code"]');
     if (codeInput) { 
-        console.log('📱 Drom запрашивает СМС код');
-        
-        // Кнопка "Отправить код"
-        const [sendBtn] = await page.$$("xpath/.//div[contains(text(), 'Отправить код')] | //button[contains(text(), 'Отправить код')]");
-        if (sendBtn) await sendBtn.click();
-
+        console.log('📱 Drom запрашивает код подтверждения');
         activeFlows.set(login, {
-            browser, 
-            page,
-            timestamp: Date.now(),
+            browser, page, timestamp: Date.now(),
             timer: setTimeout(() => cleanupFlow(login), 300 * 1000)
         });
 
