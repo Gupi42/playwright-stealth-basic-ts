@@ -12,6 +12,10 @@ puppeteer.use(StealthPlugin());
 
 const app = express();
 app.use(express.json());
+// --- КОНФИГУРАЦИЯ ---
+const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || path.join(__dirname, 'data');
+const SESSIONS_DIR = path.join(DATA_DIR, 'sessions');
+const DEBUG_DIR = path.join(DATA_DIR, 'debug');
 app.use('/screenshots', express.static(DEBUG_DIR));
 // === 🛡️ ЗАЩИТА (MIDDLEWARE) ===
 app.use((req, res, next) => {
@@ -33,11 +37,6 @@ app.use((req, res, next) => {
     }
     next();
 });
-
-// --- КОНФИГУРАЦИЯ ---
-const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || path.join(__dirname, 'data');
-const SESSIONS_DIR = path.join(DATA_DIR, 'sessions');
-const DEBUG_DIR = path.join(DATA_DIR, 'debug');
 
 if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 if (!fs.existsSync(DEBUG_DIR)) fs.mkdirSync(DEBUG_DIR, { recursive: true });
