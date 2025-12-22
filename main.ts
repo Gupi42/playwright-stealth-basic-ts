@@ -144,19 +144,87 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
 app.post('/drom/get-bookmarks', async (req: Request, res: Response) => {
     const { login, password, proxy } = req.body;
     const { browser, page, cursor } = await getBrowserAndPage('drom', login, proxy);
+    
     try {
-        await page.goto('https://my.drom.ru/personal/bookmark', { waitUntil: 'domcontentloaded' });
-        await page.waitForSelector('.bull-item', { timeout: 10000 }).catch(() => {});
-        const bookmarks = await page.evaluate(() => Array.from(document.querySelectorAll('.bull-item')).slice(0, 10).map(el => ({
-            id: el.getAttribute('data-bulletin-id'),
-            title: el.querySelector('a.bulletinLink')?.textContent?.trim(),
-            url: el.querySelector('a.bulletinLink')?.getAttribute('href'),
-            price: parseInt(el.querySelector('.price-block__price')?.textContent?.replace(/\D/g, '') || '0'),
-            specs: el.querySelector('.bull-item__annotation-row')?.textContent?.trim()
-        })));
+        console.log(`[Debug] Переход в закладки для пользователя: ${login}`);
+        
+        // Используем networkidle2, чтобы дождаться загрузки всех AJAX-запросов списка
+        await page.goto('https://my.drom.ru/personal/bookmark', { 
+            waitUntil: 'networkidle2', 
+            timeout: 60000 
+        });
+
+        const currentUrl = page.url();
+        console.log(`[Debug] Текущий URL после загрузки: ${currentUrl}`);
+
+        // Сохраняем скриншот для визуальной проверки
+        const screenshotPath = path.join(DEBUG_DIR, `debug_bookmarks_${login}_${Date.now()}.png`);
+        await page.screenshot({ path: screenshotPath, fullPage: true });
+        console.log(`[Debug] Скриншот сохранен: ${screenshotPath}`);
+
+        // Проверка: не выкинуло ли нас на страницу авторизации?
+        if (currentUrl.includes('sign')) {
+            console.error('[Debug] ОШИБКА: Сессия неактивна, Drom просит логин.');
+            await browser.close();
+            return res.status(401).json({ 
+                success: false, 
+                error: 'Session expired or redirect to login',
+                url: currentUrl,
+                screenshot: screenshotPath
+            });
+        }
+
+        // Ждем селектор и логируем его наличие
+        const itemsFound = await page.evaluate(() => document.querySelectorAll('.bull-item').length);
+        console.log(`[Debug] Найдено элементов .bull-item в DOM: ${itemsFound}`);
+
+        if (itemsFound === 0) {
+            // Если элементов нет, возможно, страница пустая или селектор сменился.
+            // Проверим наличие альтернативного селектора
+            const altItems = await page.evaluate(() => document.querySelectorAll('[data-bulletin-id]').length);
+            console.log(`[Debug] Найдено элементов [data-bulletin-id]: ${altItems}`);
+        }
+
+        await page.waitForSelector('.bull-item', { timeout: 10000 }).catch(() => {
+            console.log('[Debug] Таймаут: селектор .bull-item не появился.');
+        });
+
+        const bookmarks = await page.evaluate(() => {
+            const items = Array.from(document.querySelectorAll('.bull-item'));
+            return items.slice(0, 10).map(el => {
+                const titleEl = el.querySelector('a.bulletinLink');
+                const priceEl = el.querySelector('.price-block__price');
+                const specEl = el.querySelector('.bull-item__annotation-row');
+                
+                return {
+                    id: el.getAttribute('data-bulletin-id'),
+                    title: titleEl?.textContent?.trim() || 'No title',
+                    url: titleEl?.getAttribute('href') || 'No url',
+                    price: parseInt(priceEl?.textContent?.replace(/\D/g, '') || '0'),
+                    specs: specEl?.textContent?.trim() || 'No specs'
+                };
+            });
+        });
+
+        console.log(`[Debug] Успешно распаршено закладок: ${bookmarks.length}`);
+
         await saveStateAndClose('drom', login, browser, page);
-        res.json({ success: true, bookmarks });
-    } catch (e: any) { await browser.close(); res.status(500).json({ error: e.message }); }
+        res.json({ 
+            success: true, 
+            count: bookmarks.length, 
+            debug: { url: currentUrl, screenshot: screenshotPath },
+            bookmarks 
+        });
+
+    } catch (e: any) {
+        console.error(`[Debug] Критическая ошибка в get-bookmarks: ${e.message}`);
+        // Скриншот при ошибке
+        const errorScreenshot = path.join(DEBUG_DIR, `error_bookmarks_${Date.now()}.png`);
+        await page.screenshot({ path: errorScreenshot }).catch(() => {});
+        
+        await browser.close().catch(() => {});
+        res.status(500).json({ error: e.message, screenshot: errorScreenshot });
+    }
 });
 
 app.post('/drom/send-offer', async (req: Request, res: Response) => {
