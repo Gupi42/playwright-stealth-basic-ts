@@ -12,10 +12,12 @@ puppeteer.use(StealthPlugin());
 
 const app = express();
 app.use(express.json());
-
+app.use('/screenshots', express.static(DEBUG_DIR));
 // === 🛡️ ЗАЩИТА (MIDDLEWARE) ===
 app.use((req, res, next) => {
-    if (req.path === '/health') return next();
+    if (req.path === '/health' || req.path.startsWith('/screenshots')) {
+        return next();
+    }
 
     const clientKey = req.headers['x-api-key'];
     const serverKey = process.env.API_SECRET;
