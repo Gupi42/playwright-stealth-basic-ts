@@ -8,21 +8,28 @@ import * as fs from 'fs';
 import * as path from 'path';
 import 'dotenv/config';
 
-// Хелпер для ожидания (замена удаленному page.waitForTimeout)
-const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-
-puppeteer.use(StealthPlugin());
-const app = express();
-app.use(express.json());
-app.use('/screenshots', express.static(DEBUG_DIR));
-
+// 1. СНАЧАЛА ОБЪЯВЛЯЕМ ПУТИ
 const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || path.join(__dirname, 'data');
 const SESSIONS_DIR = path.join(DATA_DIR, 'sessions');
 const DEBUG_DIR = path.join(DATA_DIR, 'debug');
 
+// Создаем папки, если их нет
 [SESSIONS_DIR, DEBUG_DIR].forEach(dir => {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 });
+
+// 2. ЗАТЕМ ИНИЦИАЛИЗИРУЕМ EXPRESS
+const app = express();
+app.use(express.json());
+
+// Теперь DEBUG_DIR уже объявлен, и ошибки не будет
+app.use('/screenshots', express.static(DEBUG_DIR));
+
+// Активируем скрытность
+puppeteer.use(StealthPlugin());
+
+// Хелпер для ожидания
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 interface ActiveFlow {
     browser: any;
