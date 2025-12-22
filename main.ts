@@ -161,7 +161,11 @@ app.post('/drom/get-bookmarks', async (req: Request, res: Response) => {
         // Сохраняем скриншот для визуальной проверки
         const screenshotPath = path.join(DEBUG_DIR, `debug_bookmarks_${login}_${Date.now()}.png`);
         await page.screenshot({ path: screenshotPath, fullPage: true });
-        console.log(`[Debug] Скриншот сохранен: ${screenshotPath}`);
+        const fileName = path.basename(screenshotPath);
+        // Формируем публичную ссылку (подставь свой домен если он не определяется автоматически)
+        const publicUrl = `${req.protocol}://${req.get('host')}/screenshots/${fileName}`;
+
+        console.log(`[Debug] Скриншот доступен по ссылке: ${publicUrl}`);
 
         // Проверка: не выкинуло ли нас на страницу авторизации?
         if (currentUrl.includes('sign')) {
@@ -171,7 +175,7 @@ app.post('/drom/get-bookmarks', async (req: Request, res: Response) => {
                 success: false, 
                 error: 'Session expired or redirect to login',
                 url: currentUrl,
-                screenshot: screenshotPath
+                screenshot: publicUrl
             });
         }
 
