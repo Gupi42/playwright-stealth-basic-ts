@@ -292,7 +292,22 @@ app.post('/avito/login', async (req: Request, res: Response) => {
         res.json({ success: true });
     } catch (e: any) { await browser.close(); res.status(500).json({ error: e.message }); }
 });
-
+app.post('/auth/reset', async (req: Request, res: Response) => {
+    const { login, service } = req.body;
+    const sessionPath = getSessionPath(service, login);
+    
+    try {
+        if (fs.existsSync(sessionPath)) {
+            fs.unlinkSync(sessionPath);
+            console.log(`🗑️ Сессия для ${login} удалена вручную.`);
+            res.json({ success: true, message: 'Session deleted. Now call login route.' });
+        } else {
+            res.json({ success: false, message: 'Session file not found.' });
+        }
+    } catch (e: any) {
+        res.status(500).json({ error: e.message });
+    }
+});
 app.post('/verify-code', async (req: Request, res: Response) => {
     const { login, code, service } = req.body;
     const flow = activeFlows.get(login);
