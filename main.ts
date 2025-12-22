@@ -12,16 +12,10 @@ puppeteer.use(StealthPlugin());
 
 const app = express();
 app.use(express.json());
-// --- КОНФИГУРАЦИЯ ---
-const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || path.join(__dirname, 'data');
-const SESSIONS_DIR = path.join(DATA_DIR, 'sessions');
-const DEBUG_DIR = path.join(DATA_DIR, 'debug');
-app.use('/screenshots', express.static(DEBUG_DIR));
+
 // === 🛡️ ЗАЩИТА (MIDDLEWARE) ===
 app.use((req, res, next) => {
-    if (req.path === '/health' || req.path.startsWith('/screenshots')) {
-        return next();
-    }
+    if (req.path === '/health') return next();
 
     const clientKey = req.headers['x-api-key'];
     const serverKey = process.env.API_SECRET;
@@ -38,6 +32,11 @@ app.use((req, res, next) => {
     next();
 });
 
+// --- КОНФИГУРАЦИЯ ---
+const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || path.join(__dirname, 'data');
+const SESSIONS_DIR = path.join(DATA_DIR, 'sessions');
+const DEBUG_DIR = path.join(DATA_DIR, 'debug');
+
 if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 if (!fs.existsSync(DEBUG_DIR)) fs.mkdirSync(DEBUG_DIR, { recursive: true });
 
@@ -49,7 +48,6 @@ function getSessionPath(login: string): string {
     const sanitized = login.replace(/[^a-zA-Z0-9]/g, '_');
     return path.join(SESSIONS_DIR, `state_${sanitized}.json`);
 }
-const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 interface ActiveFlow {
     browser: any;
@@ -57,47 +55,7 @@ interface ActiveFlow {
     timestamp: number;
     timer: NodeJS.Timeout;
 }
-async function performHardLogout(page: any, login: string) {
-    console.log(`[${login}] Начинаем глубокую очистку аккаунта...`);
 
-    // 1. Удаляем файл сессии с диска
-    const sessionPath = getSessionPath(login);
-    if (fs.existsSync(sessionPath)) {
-        try {
-            fs.unlinkSync(sessionPath);
-            console.log(`[${login}] Файл сессии удален с диска.`);
-        } catch (e) {
-            console.error(` Ошибка удаления файла:`, e);
-        }
-    }
-
-    try {
-        // 2. Переход на страницу выхода (сброс сессии на стороне сервера Drom)
-        // Используем try/catch на случай, если страница не загрузится
-        await page.goto('https://my.drom.ru/logout', { waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {});
-
-        // 3. Команда Chrome DevTools Protocol для полной очистки куки и кэша
-        const client = await page.target().createCDPSession();
-        await client.send('Network.clearBrowserCookies');
-        await client.send('Network.clearBrowserCache');
-
-        // 4. Очистка LocalStorage, SessionStorage и IndexedDB внутри браузера
-        await page.evaluate(() => {
-            localStorage.clear();
-            sessionStorage.clear();
-            // Чистим IndexedDB (иногда Drom хранит там токены)
-            window.indexedDB.databases().then(dbs => {
-                dbs.forEach(db => {
-                    if (db.name) window.indexedDB.deleteDatabase(db.name);
-                });
-            });
-        });
-        
-        console.log(`[${login}] Браузер полностью очищен.`);
-    } catch (error) {
-        console.error(`[${login}] Ошибка при очистке внутри браузера:`, error);
-    }
-}
 const activeFlows: Map<string, ActiveFlow> = new Map();
 
 async function cleanupFlow(login: string) {
@@ -177,119 +135,147 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
 
     let proxyConfig = null;
     let proxyServerArg = undefined;
+
+    // Парсим прокси
     const proxyToUse = proxyUrl || GLOBAL_PROXY_URL;
     if (proxyToUse) {
         proxyConfig = parseProxy(proxyToUse);
-        if (proxyConfig) proxyServerArg = proxyConfig.server;
+        if (proxyConfig) {
+            proxyServerArg = proxyConfig.server; // Только http://ip:port
+            console.log(`🌐 Прокси: ${proxyServerArg}`);
+        }
     }
 
     const browser = await getBrowserInstance(proxyServerArg);
     const page = await browser.newPage();
 
-    // ВЫЗЫВАЕМ ОЧИСТКУ ПЕРЕД ВХОДОМ
-    await performHardLogout(page, login);
+    // ВАЖНО: Авторизация на прокси
+    if (proxyConfig && proxyConfig.username && proxyConfig.password) {
+        console.log('🔑 Авторизация на прокси...');
+        await page.authenticate({
+            username: proxyConfig.username,
+            password: proxyConfig.password
+        });
+    }
     
     await page.setViewport({ width: 1366, height: 768 });
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36');
 
-    // === ШАГ 0: ГЛУБОКАЯ ОЧИСТКА ===
-    console.log(`[${login}] Выполняем логаут и очистку данных...`);
-    try {
-        // 1. Прямой переход на логаут (быстрее чем искать кнопку)
-        await page.goto('https://my.drom.ru/logout', { waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
-        
-        // 2. Очистка через системные команды Chrome
-        const client = await page.target().createCDPSession();
-        await client.send('Network.clearBrowserCookies');
-        await client.send('Network.clearBrowserCache');
-        
-        // 3. Очистка локального хранилища
-        await page.goto('https://my.drom.ru/', { waitUntil: 'domcontentloaded' });
-        await page.evaluate(() => {
-            localStorage.clear();
-            sessionStorage.clear();
-        });
-    } catch (e) {
-        console.log('Ошибка при логауте (возможно, уже разлогинен)');
-    }
-
     // Блокировка ресурсов
     await page.setRequestInterception(true);
     page.on('request', (req: any) => {
-        if (['image', 'font', 'media', 'stylesheet'].includes(req.resourceType())) req.abort();
-        else req.continue();
+        const type = req.resourceType();
+        if (['image', 'font', 'media', 'stylesheet'].includes(type)) {
+            req.abort();
+        } else {
+            req.continue();
+        }
     });
 
-    // 1. Попытка восстановить сессию именно для этого логина
+    // 1. Попытка восстановить сессию
     const sessionPath = getSessionPath(login);
     if (fs.existsSync(sessionPath)) {
         try {
             const state = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
-            if (state.cookies) await page.setCookie(...state.cookies);
-            if (state.localStorage) {
-                // Восстанавливаем localStorage перед заходом
-                await page.evaluateOnNewDocument((data: any) => {
-                    localStorage.clear();
-                    data.forEach((item: any) => localStorage.setItem(item.name, item.value));
-                }, state.localStorage);
-            }
+            const stats = fs.statSync(sessionPath);
 
-            console.log(`🔄 Пробуем восстановить сессию для ${login}...`);
-            await page.goto('https://my.drom.ru/personal/', { waitUntil: 'networkidle2', timeout: 60000 });
-            
-            if (!page.url().includes('sign')) {
-                console.log('✅ Сессия восстановлена');
-                return { success: true, browser, page };
+            // Сессия моложе 30 дней
+            if (Date.now() - stats.mtimeMs < 30 * 24 * 60 * 60 * 1000) {
+                if (state.cookies && Array.isArray(state.cookies)) {
+                    await page.setCookie(...state.cookies);
+                }
+                
+                // LocalStorage restore logic if needed (complex in puppeteer without context)
+                // Puppeteer не имеет метода addInitScript как Playwright в явном виде для контекста,
+                // но можно использовать evaluateOnNewDocument
+                if (state.localStorage) {
+                     await page.evaluateOnNewDocument((data: any) => {
+                        localStorage.clear();
+                        data.forEach((item: any) => localStorage.setItem(item.name, item.value));
+                    }, state.localStorage);
+                }
+
+                console.log(`🔄 Пробуем восстановить сессию для ${login}...`);
+                
+                try {
+                   await page.goto('https://my.drom.ru/personal/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+                   
+                   // Проверка, не выкинуло ли на логин
+                   if (!page.url().includes('sign')) {
+                        console.log('✅ Сессия восстановлена');
+                        return { success: true, browser, page };
+                   }
+                } catch(e) {
+                   console.log('⚠️ Ошибка при переходе с куками:', e);
+                }
             }
-        } catch (e) { console.log('Сессия не подошла'); }
+            console.log('⚠️ Сессия устарела или невалидна, нужен ре-логин');
+        } catch (e) { 
+            console.error('Ошибка чтения сессии', e); 
+        }
     }
 
-    // 2. Если сессии нет — идем на логин
-    console.log(`🔐 Входим по паролю в аккаунт: ${login}`);
-    await page.goto('https://my.drom.ru/sign', { waitUntil: 'networkidle2', timeout: 60000 });
+    // 2. Вход с паролем
+    console.log('🔐 Входим по логину/паролю...');
+    await page.goto('https://my.drom.ru/sign', { waitUntil: 'domcontentloaded', timeout: 60000 });
 
+    const loginInputSelector = 'input[name="sign"]';
     try {
-        await page.waitForSelector('input[name="sign"]', { visible: true, timeout: 15000 });
-        await page.type('input[name="sign"]', login, { delay: 100 });
+        await page.waitForSelector(loginInputSelector, { visible: true, timeout: 15000 });
+        await page.type(loginInputSelector, login, { delay: 100 });
+        await new Promise(r => setTimeout(r, 300));
+        
         await page.type('input[type="password"]', password, { delay: 100 });
+        await new Promise(r => setTimeout(r, 500));
 
         // Ищем кнопку "Войти с паролем"
+        // Puppeteer не имеет псевдо-селекторов :has-text, используем xpath или evaluate
         const [button] = await page.$$("xpath/.//button[contains(., 'Войти с паролем')]");
-        
-        // Используем Promise.all для предотвращения ошибки "Execution context destroyed"
         if (button) {
-            await Promise.all([
-                page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {}),
-                button.click()
-            ]);
+            await button.click();
         } else {
-            await Promise.all([
-                page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {}),
-                page.click('button[type="submit"]')
-            ]);
+             // Fallback если текст другой
+             await page.click('button[type="submit"]');
         }
+
+        await new Promise(r => setTimeout(r, 3000));
         
-        await delay(3000); // Даем время на обработку редиректов
-        
-    } catch (e: any) {
-        console.error("Ошибка ввода данных:", e.message);
+    } catch (e) {
+        console.error("Ошибка при вводе логина:", e);
         await browser.close();
         throw e;
     }
 
     // 3. Проверка 2FA
+    const currentUrl = page.url();
+    // const bodyText = await page.$eval('body', (el:any) => el.innerText); 
+    // ^ это может быть долго, проще проверить наличие элементов
+    
+    // Проверяем наличие поля ввода кода
     const codeInput = await page.$('input[name="code"]');
-    if (codeInput) { 
+    
+    if (codeInput || currentUrl.includes('/sign')) { 
+        // Если мы все еще на /sign и есть намек на код
         console.log('📱 Drom запрашивает код подтверждения');
+        
+        // Поиск кнопки отправить код (если она есть)
+        const [sendBtn] = await page.$$("xpath/.//div[contains(text(), 'Отправить код')] | //button[contains(text(), 'Отправить код')]");
+        if (sendBtn) {
+            await sendBtn.click();
+            console.log('SMS запрошена');
+        }
+
         activeFlows.set(login, {
-            browser, page, timestamp: Date.now(),
+            browser, 
+            page,
+            timestamp: Date.now(),
             timer: setTimeout(() => cleanupFlow(login), 300 * 1000)
         });
 
         return {
             success: false,
             needsVerification: true,
-            message: 'Требуется код подтверждения.'
+            message: 'Требуется код подтверждения. Отправьте его в следующем запросе.'
         };
     }
 
@@ -356,154 +342,35 @@ async function saveStateAndClose(login: string, browser: any, page: any) {
 }
 
 // --- РОУТЫ ---
-app.post('/drom/my-screenshot', async (req: Request, res: Response) => {
-    const { login, password, proxy } = req.body;
-    if (!login || !password) return res.status(400).json({ error: 'Login/password required' });
 
-    let browserData: any;
-    const timestamp = Date.now();
-    const screenshotName = `my_page_${login}_${timestamp}.png`;
-    const screenshotPath = path.join(DEBUG_DIR, screenshotName);
-    
-    // Хелпер для формирования ссылки
-    const makeDebugUrl = (name: string) => `${req.protocol}://${req.get('host')}/screenshots/${name}`;
-
-    try {
-        console.log(`[Debug] [${login}] Запрос скриншота личного кабинета...`);
-
-        // Инициируем вход (подхватит сессию или запросит код)
-        const result: any = await startLoginFlow(login, password, proxy);
-        
-        if (result.needsVerification) {
-            console.log(`[Debug] [${login}] Для скриншота требуется СМС-код`);
-            return res.status(202).json(result);
-        }
-
-        browserData = result;
-        const { page, browser } = browserData;
-
-        console.log(`[Debug] [${login}] Переход на https://www.drom.ru/my/`);
-        
-        // Переходим на целевую страницу
-        await page.goto('https://www.drom.ru/my/', { 
-            waitUntil: 'networkidle2', 
-            timeout: 60000 
-        });
-
-        // Небольшая пауза, чтобы прогрузились все виджеты личного кабинета
-        await delay(2000);
-
-        // Делаем скриншот всей страницы
-        await page.screenshot({ 
-            path: screenshotPath, 
-            fullPage: true 
-        });
-
-        console.log(`[Debug] [${login}] Скриншот готов: ${screenshotName}`);
-
-        // Сохраняем состояние и закрываем браузер
-        await saveStateAndClose(login, browser, page);
-
-        res.json({ 
-            success: true, 
-            url: 'https://www.drom.ru/my/',
-            screenshot_url: makeDebugUrl(screenshotName) 
-        });
-
-    } catch (e: any) {
-        console.error(`[Debug] Ошибка при создании скриншота: ${e.message}`);
-        
-        // Попытка сделать скриншот ошибки
-        let errUrl = '';
-        if (browserData?.page) {
-            const errName = `error_my_${login}_${timestamp}.png`;
-            await browserData.page.screenshot({ path: path.join(DEBUG_DIR, errName) }).catch(() => {});
-            errUrl = makeDebugUrl(errName);
-        }
-
-        if (browserData?.browser) await browserData.browser.close().catch(() => {});
-        
-        res.status(500).json({ 
-            success: false, 
-            error: e.message, 
-            error_screenshot: errUrl 
-        });
-    }
-});
-app.post('/drom/logout', async (req: Request, res: Response) => {
-    const { login, proxy } = req.body;
-    if (!login) return res.status(400).json({ error: 'Login required' });
-
-    const browser = await getBrowserInstance(); // Запускаем без прокси или с ним
-    const page = await browser.newPage();
-
-    try {
-        await performHardLogout(page, login);
-        res.json({ success: true, message: `Account ${login} logged out and cleared.` });
-    } catch (e: any) {
-        res.status(500).json({ error: e.message });
-    } finally {
-        await browser.close();
-    }
-});
 // 1. ПОЛУЧЕНИЕ СООБЩЕНИЙ
 app.post('/drom/get-messages', async (req: Request, res: Response) => {
     const { login, password, verificationCode, proxy } = req.body;
     if (!login || !password) return res.status(400).json({ error: 'Login/password required' });
 
-    let browserData: any;
-    const timestamp = Date.now();
-    const makeDebugUrl = (name: string) => `${req.protocol}://${req.get('host')}/screenshots/${name}`;
-
+    let browserData;
     try {
-        console.log(`[Debug] [${login}] Начинаем получение сообщений...`);
-
-        // 1. Авторизация
         if (verificationCode) {
-            console.log(`[Debug] [${login}] Завершаем вход по коду...`);
             browserData = await completeLoginFlow(login, verificationCode);
         } else {
-            console.log(`[Debug] [${login}] Запускаем стандартный вход...`);
             const result: any = await startLoginFlow(login, password, proxy);
-            if (result.needsVerification) {
-                console.log(`[Debug] [${login}] Требуется 2FA код`);
-                return res.status(202).json(result);
-            }
+            if (result.needsVerification) return res.status(202).json(result);
             browserData = result;
         }
 
         const { page, browser } = browserData;
+        console.log('💬 Загрузка списка диалогов...');
+        
+        await page.goto('https://my.drom.ru/personal/messaging-modal?switchPosition=dialogs', { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-        // 2. Переход к списку диалогов
-        console.log(`[Debug] [${login}] Переход к списку диалогов...`);
-        await page.goto('https://my.drom.ru/personal/messaging-modal?switchPosition=dialogs', { 
-            waitUntil: 'networkidle2', 
-            timeout: 60000 
-        });
-
-        // Скриншот списка диалогов
-        const listImgName = `list_${login}_${timestamp}.png`;
-        await page.screenshot({ path: path.join(DEBUG_DIR, listImgName), fullPage: true });
-        console.log(`[Debug] [${login}] Скриншот списка сохранен: ${makeDebugUrl(listImgName)}`);
-
-        // 3. Ожидание списка
         try {
-            await page.waitForSelector('.dialog-list__li', { timeout: 15000 });
-            console.log(`[Debug] [${login}] Селектор .dialog-list__li найден`);
-        } catch (e) {
-            console.log(`[Debug] [${login}] Диалогов не найдено или страница не прогрузилась`);
-            const emptyImgName = `empty_${login}_${timestamp}.png`;
-            await page.screenshot({ path: path.join(DEBUG_DIR, emptyImgName) });
+            await page.waitForSelector('.dialog-list__li', { timeout: 10000 });
+        } catch {
+            console.log('Диалогов нет');
             await saveStateAndClose(login, browser, page);
-            return res.json({ 
-                success: true, 
-                count: 0, 
-                dialogs: [], 
-                debug_screenshot: makeDebugUrl(emptyImgName) 
-            });
+            return res.json({ success: true, count: 0, dialogs: [] });
         }
 
-        // 4. Парсинг ID диалогов
         const dialogsList = await page.evaluate(() => {
             return Array.from(document.querySelectorAll('.dialog-list__li'))
                 .map(el => {
@@ -514,22 +381,19 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
                 .filter(Boolean);
         });
 
-        console.log(`[Debug] [${login}] Найдено ID диалогов: ${dialogsList.length}`);
-
         const limit = Math.min(dialogsList.length, 10);
+        console.log(`📋 Обработка ${limit} диалогов...`);
         const detailedDialogs = [];
 
-        // 5. Цикл по деталям диалогов
         for (let i = 0; i < limit; i++) {
             const dItem: any = dialogsList[i];
             try {
-                console.log(`[Debug] [${login}] Парсим диалог ${dItem.dialogId} (${i + 1}/${limit})...`);
-                await page.goto(`https://my.drom.ru/personal/messaging/view?dialogId=${dItem.dialogId}`, { 
-                    waitUntil: 'networkidle2',
-                    timeout: 30000 
-                });
+                // В Puppeteer сложнее кликнуть по конкретному элементу из списка, проще перейти по URL
+                await page.goto(`https://my.drom.ru/personal/messaging/view?dialogId=${dItem.dialogId}`, { waitUntil: 'domcontentloaded' });
                 
-                await page.waitForSelector('.bzr-dialog__inner', { timeout: 10000 });
+                try {
+                     await page.waitForSelector('.bzr-dialog__inner', { timeout: 8000 });
+                } catch(e) { continue; }
 
                 const details = await page.evaluate(() => {
                     const carLink = document.querySelector('.bzr-dialog-header__sub-title a');
@@ -543,8 +407,9 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
 
                     for (let j = allMessages.length - 1; j >= 0; j--) {
                         const msg = allMessages[j];
-                        if (msg.classList.contains('bzr-dialog__message_out')) break;
-                        
+                        if (msg.classList.contains('bzr-dialog__message_out')) {
+                            break;
+                        }
                         if (msg.classList.contains('bzr-dialog__message_in')) {
                             const text = msg.querySelector('.bzr-dialog__text')?.textContent?.trim() || '';
                             if (text) buffer.unshift(text);
@@ -554,10 +419,11 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
                         }
                     }
 
+                    const combinedText = buffer.join('\n');
                     return {
                         carTitle,
                         carUrl,
-                        lastIncomingText: buffer.join('\n'),
+                        lastIncomingText: combinedText,
                         lastIncomingTime: lastTime
                     };
                 });
@@ -566,39 +432,24 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
                     detailedDialogs.push({ dialogId: dItem.dialogId, ...details });
                 }
 
-                // Небольшая задержка между диалогами
-                await new Promise(r => setTimeout(r, 1000));
+                await new Promise(r => setTimeout(r, Math.random() * 1000 + 500));
 
-            } catch (e: any) {
-                console.error(`[Error] Ошибка парсинга диалога ${dItem.dialogId}:`, e.message);
+            } catch (e) {
+                console.error(`Error dialog ${dItem.dialogId}`, e);
             }
         }
 
-        console.log(`[Debug] [${login}] Сбор завершен. Успешно: ${detailedDialogs.length}`);
+        console.log(`✅ Собрано ${detailedDialogs.length}`);
         await saveStateAndClose(login, browser, page);
-        
-        res.json({ 
-            success: true, 
-            count: detailedDialogs.length, 
-            dialogs: detailedDialogs,
-            debug_screenshot: makeDebugUrl(listImgName)
-        });
+        res.json({ success: true, count: detailedDialogs.length, dialogs: detailedDialogs });
 
     } catch (err: any) {
-        console.error('[CRITICAL ERROR]:', err.message);
-        const errImgName = `critical_err_${login}_${timestamp}.png`;
-        if (browserData?.page) {
-            await browserData.page.screenshot({ path: path.join(DEBUG_DIR, errImgName) }).catch(() => {});
-        }
+        console.error('CRITICAL ERROR:', err.message);
         if (browserData?.browser) await browserData.browser.close().catch(() => {});
-        
-        res.status(500).json({ 
-            success: false, 
-            error: err.message, 
-            debug_screenshot: makeDebugUrl(errImgName) 
-        });
+        res.status(500).json({ success: false, error: err.message });
     }
 });
+
 // 2. ОТПРАВКА СООБЩЕНИЯ
 app.post('/drom/send-message', async (req: Request, res: Response) => {
     const { login, password, dialogId, message, proxy } = req.body;
