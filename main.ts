@@ -57,7 +57,47 @@ interface ActiveFlow {
     timestamp: number;
     timer: NodeJS.Timeout;
 }
+async function performHardLogout(page: any, login: string) {
+    console.log(`[${login}] Начинаем глубокую очистку аккаунта...`);
 
+    // 1. Удаляем файл сессии с диска
+    const sessionPath = getSessionPath(login);
+    if (fs.existsSync(sessionPath)) {
+        try {
+            fs.unlinkSync(sessionPath);
+            console.log(`[${login}] Файл сессии удален с диска.`);
+        } catch (e) {
+            console.error(` Ошибка удаления файла:`, e);
+        }
+    }
+
+    try {
+        // 2. Переход на страницу выхода (сброс сессии на стороне сервера Drom)
+        // Используем try/catch на случай, если страница не загрузится
+        await page.goto('https://my.drom.ru/logout', { waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {});
+
+        // 3. Команда Chrome DevTools Protocol для полной очистки куки и кэша
+        const client = await page.target().createCDPSession();
+        await client.send('Network.clearBrowserCookies');
+        await client.send('Network.clearBrowserCache');
+
+        // 4. Очистка LocalStorage, SessionStorage и IndexedDB внутри браузера
+        await page.evaluate(() => {
+            localStorage.clear();
+            sessionStorage.clear();
+            // Чистим IndexedDB (иногда Drom хранит там токены)
+            window.indexedDB.databases().then(dbs => {
+                dbs.forEach(db => {
+                    if (db.name) window.indexedDB.deleteDatabase(db.name);
+                });
+            });
+        });
+        
+        console.log(`[${login}] Браузер полностью очищен.`);
+    } catch (error) {
+        console.error(`[${login}] Ошибка при очистке внутри браузера:`, error);
+    }
+}
 const activeFlows: Map<string, ActiveFlow> = new Map();
 
 async function cleanupFlow(login: string) {
@@ -146,9 +186,8 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
     const browser = await getBrowserInstance(proxyServerArg);
     const page = await browser.newPage();
 
-    if (proxyConfig?.username) {
-        await page.authenticate({ username: proxyConfig.username, password: proxyConfig.password });
-    }
+    // ВЫЗЫВАЕМ ОЧИСТКУ ПЕРЕД ВХОДОМ
+    await performHardLogout(page, login);
     
     await page.setViewport({ width: 1366, height: 768 });
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36');
@@ -317,7 +356,22 @@ async function saveStateAndClose(login: string, browser: any, page: any) {
 }
 
 // --- РОУТЫ ---
+app.post('/drom/logout', async (req: Request, res: Response) => {
+    const { login, proxy } = req.body;
+    if (!login) return res.status(400).json({ error: 'Login required' });
 
+    const browser = await getBrowserInstance(); // Запускаем без прокси или с ним
+    const page = await browser.newPage();
+
+    try {
+        await performHardLogout(page, login);
+        res.json({ success: true, message: `Account ${login} logged out and cleared.` });
+    } catch (e: any) {
+        res.status(500).json({ error: e.message });
+    } finally {
+        await browser.close();
+    }
+});
 // 1. ПОЛУЧЕНИЕ СООБЩЕНИЙ
 app.post('/drom/get-messages', async (req: Request, res: Response) => {
     const { login, password, verificationCode, proxy } = req.body;
