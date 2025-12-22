@@ -8,7 +8,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 import 'dotenv/config';
 
-// --- ИНИЦИАЛИЗАЦИЯ ---
+// Хелпер для ожидания (замена удаленному page.waitForTimeout)
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
 puppeteer.use(StealthPlugin());
 const app = express();
 app.use(express.json());
@@ -21,7 +23,6 @@ const DEBUG_DIR = path.join(DATA_DIR, 'debug');
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 });
 
-// --- ТИПЫ ---
 interface ActiveFlow {
     browser: any;
     page: any;
@@ -30,7 +31,6 @@ interface ActiveFlow {
 }
 const activeFlows: Map<string, ActiveFlow> = new Map();
 
-// --- Вспомогательные функции ---
 function parseProxy(proxyUrl?: string) {
     if (!proxyUrl) return null;
     try {
@@ -51,15 +51,18 @@ async function cleanupFlow(login: string) {
     }
 }
 
-// --- ЯДРО БРАУЗЕРА ---
 async function getBrowserAndPage(service: string, login: string, proxyUrl?: string) {
     const proxyConfig = parseProxy(proxyUrl || process.env.PROXY_URL);
     const args = ['--no-sandbox', '--disable-setuid-sandbox', '--window-size=1366,768', '--disable-blink-features=AutomationControlled'];
     if (proxyConfig?.server) args.push(`--proxy-server=${proxyConfig.server}`);
 
-    const browser = await puppeteer.launch({ headless: "new", args, executablePath: process.env.PUPPETEER_EXECUTABLE_PATH });
+    const browser = await puppeteer.launch({ 
+        headless: true, // Исправлено: "new" заменен на true
+        args, 
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH 
+    });
     const page = await browser.newPage();
-    const cursor = createCursor(page);
+    const cursor = await createCursor(page);
 
     if (proxyConfig?.username) await page.authenticate({ username: proxyConfig.username, password: proxyConfig.password });
     
@@ -93,14 +96,11 @@ async function saveStateAndClose(service: string, login: string, browser: any, p
     } finally { await browser.close().catch(() => {}); }
 }
 
-// --- MIDDLEWARE БЕЗОПАСНОСТИ ---
 app.use((req, res, next) => {
     if (req.path === '/health') return next();
     if (req.headers['x-api-key'] !== process.env.API_SECRET) return res.status(403).json({ error: 'Forbidden' });
     next();
 });
-
-// --- РОУТЫ DROM ---
 
 app.post('/drom/get-messages', async (req: Request, res: Response) => {
     const { login, password, proxy } = req.body;
@@ -111,7 +111,7 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
             await page.type('input[name="sign"]', login, { delay: 50 });
             await page.type('input[type="password"]', password, { delay: 50 });
             await cursor.click('button[type="submit"]');
-            await page.waitForTimeout(3000);
+            await delay(3000); // Заменено page.waitForTimeout
             if (await page.$('input[name="code"]')) {
                 activeFlows.set(login, { browser, page, cursor, timer: setTimeout(() => cleanupFlow(login), 300000) });
                 return res.status(202).json({ needsVerification: true });
@@ -170,7 +170,7 @@ app.post('/drom/send-offer', async (req: Request, res: Response) => {
         await page.waitForSelector('textarea', { visible: true });
         await page.type('textarea', message, { delay: 50 });
         await cursor.click('button[data-ga-stats-name="send_question"]');
-        await page.waitForTimeout(3000);
+        await delay(3000); // Заменено page.waitForTimeout
         await saveStateAndClose('drom', login, browser, page);
         res.json({ success: true });
     } catch (e: any) { await browser.close(); res.status(500).json({ error: e.message }); }
@@ -184,13 +184,11 @@ app.post('/drom/send-message', async (req: Request, res: Response) => {
         await page.waitForSelector('textarea[name="message"]', { visible: true });
         await page.type('textarea[name="message"]', message, { delay: 30 });
         await cursor.click('button[name="post"]');
-        await page.waitForTimeout(2000);
+        await delay(2000); // Заменено page.waitForTimeout
         await saveStateAndClose('drom', login, browser, page);
         res.json({ success: true });
     } catch (e: any) { await browser.close(); res.status(500).json({ error: e.message }); }
 });
-
-// --- РОУТЫ AVITO ---
 
 app.post('/avito/login', async (req: Request, res: Response) => {
     const { login, password, proxy } = req.body;
@@ -201,7 +199,7 @@ app.post('/avito/login', async (req: Request, res: Response) => {
         await page.type('input[data-marker="login-form/login/input"]', login, { delay: 60 });
         await page.type('input[data-marker="login-form/password/input"]', password, { delay: 60 });
         await cursor.click('button[data-marker="login-form/submit"]');
-        await page.waitForTimeout(5000);
+        await delay(5000); // Заменено page.waitForTimeout
         if (await page.$('[data-marker="phone-confirm-wrapper"]')) {
             activeFlows.set(login, { browser, page, cursor, timer: setTimeout(() => cleanupFlow(login), 300000) });
             return res.status(202).json({ needsVerification: true });
@@ -210,8 +208,6 @@ app.post('/avito/login', async (req: Request, res: Response) => {
         res.json({ success: true });
     } catch (e: any) { await browser.close(); res.status(500).json({ error: e.message }); }
 });
-
-// --- ОБЩИЙ ВЕРИФИКАТОР ---
 
 app.post('/verify-code', async (req: Request, res: Response) => {
     const { login, code, service } = req.body;
