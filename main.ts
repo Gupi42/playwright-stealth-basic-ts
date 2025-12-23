@@ -7,7 +7,6 @@ import * as fs from 'fs';
 import * as path from 'path';
 import 'dotenv/config';
 
-// 1. Активируем скрытность
 puppeteer.use(StealthPlugin());
 
 const app = express();
@@ -40,7 +39,6 @@ const DEBUG_DIR = path.join(DATA_DIR, 'debug');
 if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 if (!fs.existsSync(DEBUG_DIR)) fs.mkdirSync(DEBUG_DIR, { recursive: true });
 
-// Глобальный прокси (резервный)
 const GLOBAL_PROXY_URL = process.env.PROXY_URL;
 
 // --- ХЕЛПЕРЫ ---
@@ -65,261 +63,58 @@ async function cleanupFlow(login: string) {
         clearTimeout(flow.timer);
         try {
             await flow.browser.close();
-        } catch (e) {}
+        } catch (e) {
+            console.error('Ошибка при закрытии браузера:', e);
+        }
         activeFlows.delete(login);
     }
 }
 
-async function humanClick(page: any, selector: string) {
+// 🆕 УЛУЧШЕННАЯ ФУНКЦИЯ ЛОГАУТА
+async function performLogout(page: any, login: string): Promise<void> {
     try {
-        await page.waitForSelector(selector, { visible: true, timeout: 5000 });
-        const element = await page.$(selector);
-        
-        if (element) {
-            const box = await element.boundingBox();
-            if (box) {
-                await page.mouse.move(
-                    box.x + box.width / 2 + (Math.random() - 0.5) * 10,
-                    box.y + box.height / 2 + (Math.random() - 0.5) * 10,
-                    { steps: 10 }
-                );
-                await new Promise(r => setTimeout(r, Math.random() * 200 + 100));
-                await element.click();
-                return true;
-            }
-        }
-    } catch (e) {
-        // Element not found or not visible
-    }
-    return false;
-}
+        console.log(`🚪 Выполняется логаут для ${login}...`);
 
-// Хелпер для парсинга прокси
-function parseProxy(proxyUrl: string) {
-    try {
-        const url = new URL(proxyUrl);
-        return {
-            server: `${url.protocol}//${url.hostname}:${url.port}`,
-            username: url.username,
-            password: url.password
-        };
-    } catch (e) {
-        return null;
-    }
-}
-
-// --- ОСНОВНАЯ ЛОГИКА БРАУЗЕРА ---
-
-async function getBrowserInstance(proxyServer?: string) {
-    const launchOptions: any = {
-        headless: "new",
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--window-size=1366,768'
-        ],
-        ignoreHTTPSErrors: true,
-        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH
-    };
-
-    if (proxyServer) {
-        launchOptions.args.push(`--proxy-server=${proxyServer}`);
-    }
-
-    return await puppeteer.launch(launchOptions);
-}
-
-async function startLoginFlow(login: string, password: string, proxyUrl?: string) {
-    await cleanupFlow(login);
-
-    let proxyConfig = null;
-    let proxyServerArg = undefined;
-
-    // Парсим прокси
-    const proxyToUse = proxyUrl || GLOBAL_PROXY_URL;
-    if (proxyToUse) {
-        proxyConfig = parseProxy(proxyToUse);
-        if (proxyConfig) {
-            proxyServerArg = proxyConfig.server; // Только http://ip:port
-            console.log(`🌐 Прокси: ${proxyServerArg}`);
-        }
-    }
-
-    const browser = await getBrowserInstance(proxyServerArg);
-    const page = await browser.newPage();
-
-    // ВАЖНО: Авторизация на прокси
-    if (proxyConfig && proxyConfig.username && proxyConfig.password) {
-        console.log('🔑 Авторизация на прокси...');
-        await page.authenticate({
-            username: proxyConfig.username,
-            password: proxyConfig.password
+        // Переходим на страницу логаута
+        await page.goto('https://my.drom.ru/logout?return=https%3A%2F%2Fauto.drom.ru%2Favtoline38%2F%3Ftcb%3D1766397803', {
+            waitUntil: 'networkidle2',
+            timeout: 30000
         });
-    }
-    
-    await page.setViewport({ width: 1366, height: 768 });
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36');
 
-    // Блокировка ресурсов
-    await page.setRequestInterception(true);
-    page.on('request', (req: any) => {
-        const type = req.resourceType();
-        if (['image', 'font', 'media', 'stylesheet'].includes(type)) {
-            req.abort();
-        } else {
-            req.continue();
+        await new Promise(r => setTimeout(r, 2000));
+
+        // Очищаем cookies и localStorage
+        const cookies = await page.cookies();
+        if (cookies.length > 0) {
+            await page.deleteCookie(...cookies);
         }
-    });
 
-    // 1. Попытка восстановить сессию
-    const sessionPath = getSessionPath(login);
-    if (fs.existsSync(sessionPath)) {
+        await page.evaluate(() => {
+            localStorage.clear();
+            sessionStorage.clear();
+        });
+
+        console.log(`✅ Логаут выполнен для ${login}`);
+    } catch (error: any) {
+        console.error(`⚠️ Ошибка при логауте для ${login}:`, error.message);
+        // Даже если логаут не удался, очищаем локальные данные
         try {
-            const state = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
-            const stats = fs.statSync(sessionPath);
-
-            // Сессия моложе 30 дней
-            if (Date.now() - stats.mtimeMs < 30 * 24 * 60 * 60 * 1000) {
-                if (state.cookies && Array.isArray(state.cookies)) {
-                    await page.setCookie(...state.cookies);
-                }
-                
-                // LocalStorage restore logic if needed (complex in puppeteer without context)
-                // Puppeteer не имеет метода addInitScript как Playwright в явном виде для контекста,
-                // но можно использовать evaluateOnNewDocument
-                if (state.localStorage) {
-                     await page.evaluateOnNewDocument((data: any) => {
-                        localStorage.clear();
-                        data.forEach((item: any) => localStorage.setItem(item.name, item.value));
-                    }, state.localStorage);
-                }
-
-                console.log(`🔄 Пробуем восстановить сессию для ${login}...`);
-                
-                try {
-                   await page.goto('https://my.drom.ru/personal/', { waitUntil: 'domcontentloaded', timeout: 60000 });
-                   
-                   // Проверка, не выкинуло ли на логин
-                   if (!page.url().includes('sign')) {
-                        console.log('✅ Сессия восстановлена');
-                        return { success: true, browser, page };
-                   }
-                } catch(e) {
-                   console.log('⚠️ Ошибка при переходе с куками:', e);
-                }
+            const cookies = await page.cookies();
+            if (cookies.length > 0) {
+                await page.deleteCookie(...cookies);
             }
-            console.log('⚠️ Сессия устарела или невалидна, нужен ре-логин');
-        } catch (e) { 
-            console.error('Ошибка чтения сессии', e); 
+            await page.evaluate(() => {
+                localStorage.clear();
+                sessionStorage.clear();
+            });
+        } catch (e) {
+            console.error('Критическая ошибка очистки:', e);
         }
-    }
-
-    // 2. Вход с паролем
-    console.log('🔐 Входим по логину/паролю...');
-    await page.goto('https://my.drom.ru/sign', { waitUntil: 'domcontentloaded', timeout: 60000 });
-
-    const loginInputSelector = 'input[name="sign"]';
-    try {
-        await page.waitForSelector(loginInputSelector, { visible: true, timeout: 15000 });
-        await page.type(loginInputSelector, login, { delay: 100 });
-        await new Promise(r => setTimeout(r, 300));
-        
-        await page.type('input[type="password"]', password, { delay: 100 });
-        await new Promise(r => setTimeout(r, 500));
-
-        // Ищем кнопку "Войти с паролем"
-        // Puppeteer не имеет псевдо-селекторов :has-text, используем xpath или evaluate
-        const [button] = await page.$$("xpath/.//button[contains(., 'Войти с паролем')]");
-        if (button) {
-            await button.click();
-        } else {
-             // Fallback если текст другой
-             await page.click('button[type="submit"]');
-        }
-
-        await new Promise(r => setTimeout(r, 3000));
-        
-    } catch (e) {
-        console.error("Ошибка при вводе логина:", e);
-        await browser.close();
-        throw e;
-    }
-
-    // 3. Проверка 2FA
-    const currentUrl = page.url();
-    // const bodyText = await page.$eval('body', (el:any) => el.innerText); 
-    // ^ это может быть долго, проще проверить наличие элементов
-    
-    // Проверяем наличие поля ввода кода
-    const codeInput = await page.$('input[name="code"]');
-    
-    if (codeInput || currentUrl.includes('/sign')) { 
-        // Если мы все еще на /sign и есть намек на код
-        console.log('📱 Drom запрашивает код подтверждения');
-        
-        // Поиск кнопки отправить код (если она есть)
-        const [sendBtn] = await page.$$("xpath/.//div[contains(text(), 'Отправить код')] | //button[contains(text(), 'Отправить код')]");
-        if (sendBtn) {
-            await sendBtn.click();
-            console.log('SMS запрошена');
-        }
-
-        activeFlows.set(login, {
-            browser, 
-            page,
-            timestamp: Date.now(),
-            timer: setTimeout(() => cleanupFlow(login), 300 * 1000)
-        });
-
-        return {
-            success: false,
-            needsVerification: true,
-            message: 'Требуется код подтверждения. Отправьте его в следующем запросе.'
-        };
-    }
-
-    return { success: true, browser, page };
-}
-
-async function completeLoginFlow(login: string, code: string) {
-    const flow = activeFlows.get(login);
-    if (!flow) throw new Error('Сессия не найдена или истекла. Повторите запрос.');
-
-    console.log(`✍️ Вводим код для ${login}...`);
-    const { page } = flow;
-
-    try {
-        const codeInputSelector = 'input[name="code"]';
-        await page.waitForSelector(codeInputSelector, { visible: true, timeout: 5000 });
-        await page.type(codeInputSelector, code, { delay: 100 });
-        
-        await new Promise(r => setTimeout(r, Math.random() * 500 + 200));
-
-        // Нажимаем подтвердить
-        const [confirmBtn] = await page.$$("xpath/.//button[contains(., 'Подтвердить') or contains(., 'Войти')]");
-        if (confirmBtn) {
-            await confirmBtn.click();
-        } else {
-            await page.keyboard.press('Enter');
-        }
-
-        // Ждем перехода
-        await page.waitForFunction(() => window.location.href.includes('/personal'), { timeout: 15000 });
-
-        console.log('🎉 Успешный вход!');
-        clearTimeout(flow.timer);
-        activeFlows.delete(login);
-
-        return { success: true, browser: flow.browser, page: flow.page };
-
-    } catch (error) {
-        await page.screenshot({ path: path.join(DEBUG_DIR, `error_code_${Date.now()}.png`) });
-        throw new Error('Неверный код или ошибка сайта');
     }
 }
 
-async function saveStateAndClose(login: string, browser: any, page: any) {
+// 🆕 УЛУЧШЕННАЯ ФУНКЦИЯ СОХРАНЕНИЯ СОСТОЯНИЯ
+async function saveStateAndClose(login: string, browser: any, page: any, skipLogout: boolean = false) {
     try {
         const cookies = await page.cookies();
         const localStorageData = await page.evaluate(() => {
@@ -331,15 +126,157 @@ async function saveStateAndClose(login: string, browser: any, page: any) {
             return data;
         });
 
-        const state = { cookies, localStorage: localStorageData };
+        const state = { 
+            cookies, 
+            localStorage: localStorageData,
+            login: login, // 🆕 Сохраняем логин для проверки
+            timestamp: Date.now() // 🆕 Время последнего сохранения
+        };
         fs.writeFileSync(getSessionPath(login), JSON.stringify(state, null, 2));
         console.log(`💾 Сессия сохранена для ${login}`);
     } catch (e) {
         console.error('Ошибка сохранения сессии:', e);
     } finally {
-        await browser.close().catch(() => {});
+        if (!skipLogout) {
+            await browser.close().catch(() => {});
+        }
     }
 }
+
+// 🆕 УЛУЧШЕННАЯ ФУНКЦИЯ ОЧИСТКИ КОНТЕКСТА ПЕРЕД ЗАГРУЗКОЙ НОВОЙ СЕССИИ
+async function clearBrowserContext(page: any): Promise<void> {
+    try {
+        console.log('🧹 Очистка контекста браузера...');
+
+        // Удаляем все cookies
+        const cookies = await page.cookies();
+        if (cookies.length > 0) {
+            await page.deleteCookie(...cookies);
+        }
+
+        // Очищаем localStorage и sessionStorage
+        await page.evaluate(() => {
+            localStorage.clear();
+            sessionStorage.clear();
+        });
+
+        console.log('✅ Контекст браузера очищен');
+    } catch (error) {
+        console.error('⚠️ Ошибка при очистке контекста:', error);
+    }
+}
+
+// 🆕 УЛУЧШЕННАЯ ФУНКЦИЯ ЗАГРУЗКИ СЕССИИ С ПРОВЕРКОЙ
+async function loadSessionIfExists(login: string, page: any): Promise<boolean> {
+    const sessionPath = getSessionPath(login);
+
+    if (!fs.existsSync(sessionPath)) {
+        console.log(`📭 Сессия для ${login} не найдена`);
+        return false;
+    }
+
+    try {
+        const state = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+
+        // 🆕 Проверяем, что сессия принадлежит нужному логину
+        if (state.login && state.login !== login) {
+            console.log(`⚠️ Сессия принадлежит другому логину (${state.login}), очищаем...`);
+            await clearBrowserContext(page);
+            return false;
+        }
+
+        // 🆕 Проверяем возраст сессии (опционально, можно добавить лимит)
+        const sessionAge = Date.now() - (state.timestamp || 0);
+        const maxAge = 7 * 24 * 60 * 60 * 1000; // 7 дней
+        if (sessionAge > maxAge) {
+            console.log(`⚠️ Сессия устарела (${Math.round(sessionAge / 86400000)} дней), требуется повторный вход`);
+            fs.unlinkSync(sessionPath);
+            return false;
+        }
+
+        // Очищаем контекст перед загрузкой новой сессии
+        await clearBrowserContext(page);
+
+        // Загружаем cookies
+        if (state.cookies && state.cookies.length > 0) {
+            await page.setCookie(...state.cookies);
+            console.log(`🍪 Загружено ${state.cookies.length} cookies`);
+        }
+
+        // Загружаем localStorage
+        if (state.localStorage && state.localStorage.length > 0) {
+            await page.evaluateOnNewDocument((data: any[]) => {
+                data.forEach(item => {
+                    if (item.name && item.value) {
+                        localStorage.setItem(item.name, item.value);
+                    }
+                });
+            }, state.localStorage);
+            console.log(`📦 Загружено ${state.localStorage.length} записей localStorage`);
+        }
+
+        console.log(`✅ Сессия успешно загружена для ${login}`);
+        return true;
+    } catch (error) {
+        console.error(`⚠️ Ошибка загрузки сессии для ${login}:`, error);
+        return false;
+    }
+}
+
+// 🆕 НОВЫЙ ENDPOINT ДЛЯ ЯВНОГО ЛОГАУТА
+app.post('/drom/logout', async (req: Request, res: Response) => {
+    const { login } = req.body;
+
+    if (!login) {
+        return res.status(400).json({ error: 'Login required' });
+    }
+
+    let browser;
+    try {
+        console.log(`🚀 Запуск логаута для ${login}...`);
+
+        const launchOptions: any = {
+            headless: true,
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-blink-features=AutomationControlled'
+            ]
+        };
+
+        browser = await puppeteer.launch(launchOptions);
+        const page = await browser.newPage();
+
+        // Загружаем сессию если есть
+        await loadSessionIfExists(login, page);
+
+        // Выполняем логаут
+        await performLogout(page, login);
+
+        // Удаляем файл сессии
+        const sessionPath = getSessionPath(login);
+        if (fs.existsSync(sessionPath)) {
+            fs.unlinkSync(sessionPath);
+            console.log(`🗑️ Файл сессии удален для ${login}`);
+        }
+
+        await browser.close();
+
+        res.json({ 
+            success: true, 
+            message: `Logout successful for ${login}` 
+        });
+
+    } catch (error: any) {
+        console.error('Logout error:', error.message);
+        if (browser) await browser.close().catch(() => {});
+        res.status(500).json({ 
+            success: false, 
+            error: error.message 
+        });
+    }
+});
 
 // --- РОУТЫ ---
 
@@ -602,8 +539,6 @@ app.post('/drom/send-offer', async (req: Request, res: Response) => {
         res.status(500).json({ success: false, error: error.message });
     }
 });
-
-
 
 app.get('/health', (_, res) => res.send('OK'));
 
