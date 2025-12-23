@@ -430,106 +430,137 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
     // 2. Вход с паролем
     console.log('🔐 Входим по логину/паролю...');
 
-    try {
-        await loadPageWithRetry(page, 'https://my.drom.ru/sign');
-
-        const content = await page.content();
-        console.log(`📄 Размер загруженной страницы: ${content.length} байт`);
-
-        if (content.length < 10000) {
-            console.warn(`⚠️ Подозрительно маленькая страница: ${content.length} байт`);
-            await takeDebugScreenshot(page, login, '03_suspicious_small_page');
-            throw new Error('Прокси вернул неполную страницу');
-        }
-
-        await takeDebugScreenshot(page, login, '03_login_page_loaded');
-
-        // ========== ПРОВЕРКА И РЕШЕНИЕ RECAPTCHA ==========
-        const recaptchaFrame = await page.$('iframe[src*="recaptcha/api2"]');
-
-        if (recaptchaFrame) {
-            console.log('🔒 Обнаружена reCAPTCHA v2!');
-            await takeDebugScreenshot(page, login, '03_5_recaptcha_detected');
-
-            // Извлекаем sitekey из iframe
-            const sitekey = await page.evaluate(() => {
-                const iframe = document.querySelector('iframe[src*="recaptcha/api2"]') as HTMLIFrameElement;
-                if (!iframe) return null;
-
-                const src = iframe.getAttribute('src') || '';
-                const match = src.match(/[?&]k=([^&]+)/);
-                return match ? match[1] : null;
-            });
-
-            if (!sitekey) {
-                console.error('❌ Не удалось найти sitekey для reCAPTCHA');
-                await takeDebugScreenshot(page, login, '03_5_no_sitekey');
-                throw new Error('reCAPTCHA sitekey not found');
-            }
-
-            console.log(`🔑 Найден sitekey: ${sitekey}`);
-
-            // Проверяем наличие API ключа
-            if (!process.env.ANTICAPTCHA_API_KEY) {
-                console.error('❌ ANTICAPTCHA_API_KEY не настроен в переменных окружения!');
-                await takeDebugScreenshot(page, login, '03_5_no_api_key');
-                throw new Error('AntiCaptcha API key not configured. Please set ANTICAPTCHA_API_KEY environment variable.');
-            }
-
-            try {
-                // Решаем капчу
-                const gresponse = await solveRecaptchaV2(page.url(), sitekey);
-
-                // Вставляем решение в страницу
-                await page.evaluate((token: string) => {
-                    // Находим textarea для g-recaptcha-response
-                    const textarea = document.querySelector('textarea[name="g-recaptcha-response"]') as HTMLTextAreaElement;
-                    if (textarea) {
-                        textarea.innerHTML = token;
-                        textarea.value = token;
-                        textarea.style.display = 'block';
-                    }
-
-                    // Также вставляем в hidden input если есть
-                    const input = document.querySelector('input[name="g-recaptcha-response"]') as HTMLInputElement;
-                    if (input) {
-                        input.value = token;
-                    }
-
-                    // Вызываем callback если он определен
-                    if (typeof (window as any).grecaptcha !== 'undefined') {
-                        const clients = (window as any).___grecaptcha_cfg?.clients;
-                        if (clients) {
-                            Object.keys(clients).forEach((key) => {
-                                const client = clients[key];
-                                if (client && client.callback) {
-                                    client.callback(token);
-                                }
-                            });
-                        }
-                    }
-                }, gresponse);
-
-                console.log('✅ Решение reCAPTCHA вставлено в страницу');
-                await new Promise(r => setTimeout(r, 1500));
-                await takeDebugScreenshot(page, login, '03_6_recaptcha_solved');
-
-            } catch (captchaError: any) {
-                console.error('❌ Ошибка при решении reCAPTCHA:', captchaError.message);
-                await takeDebugScreenshot(page, login, '03_5_captcha_error');
-                await browser.close();
-                throw new Error(`Failed to solve reCAPTCHA: ${captchaError.message}`);
-            }
-        } else {
-            console.log('✅ reCAPTCHA не обнаружена, продолжаем без решения');
-        }
-
-    } catch (e) {
-        console.error('❌ Ошибка загрузки страницы логина:', e);
-        await takeDebugScreenshot(page, login, '03_login_page_load_error');
-        await browser.close();
-        throw e;
+try {
+    await loadPageWithRetry(page, 'https://my.drom.ru/sign');
+    
+    const content = await page.content();
+    console.log(`📄 Размер загруженной страницы: ${content.length} байт`);
+    
+    if (content.length < 10000) {
+        console.warn(`⚠️ Подозрительно маленькая страница: ${content.length} байт`);
+        await takeDebugScreenshot(page, login, '03_suspicious_small_page');
+        throw new Error('Прокси вернул неполную страницу');
     }
+
+    await takeDebugScreenshot(page, login, '03_login_page_loaded');
+
+    // ========== ОЖИДАНИЕ И ПРОВЕРКА RECAPTCHA ==========
+    console.log('🔍 Ожидание полной загрузки страницы (включая reCAPTCHA)...');
+    
+    // Ждём 5 секунд для загрузки всех асинхронных элементов (включая reCAPTCHA)
+    await new Promise(r => setTimeout(r, 5000));
+    
+    // Дополнительно ждём появления либо формы входа, либо reCAPTCHA
+    await Promise.race([
+        page.waitForSelector('input[name="sign"]', { timeout: 10000 }).catch(() => null),
+        page.waitForSelector('iframe[src*="recaptcha"]', { timeout: 10000 }).catch(() => null),
+        new Promise(r => setTimeout(r, 10000))
+    ]);
+    
+    // Делаем скриншот после ожидания
+    await takeDebugScreenshot(page, login, '03_5_after_wait');
+    
+    // ТЕПЕРЬ проверяем reCAPTCHA
+    const recaptchaFrame = await page.$('iframe[src*="recaptcha/api2"]');
+    
+    if (recaptchaFrame) {
+        console.log('🔒 Обнаружена reCAPTCHA v2!');
+        await takeDebugScreenshot(page, login, '03_6_recaptcha_detected');
+        
+        // Извлекаем sitekey
+        const sitekey = await page.evaluate(() => {
+            const iframe = document.querySelector('iframe[src*="recaptcha/api2"]') as HTMLIFrameElement;
+            if (!iframe) return null;
+            
+            const src = iframe.getAttribute('src') || '';
+            const match = src.match(/[?&]k=([^&]+)/);
+            return match ? match[1] : null;
+        });
+        
+        if (!sitekey) {
+            console.error('❌ Не удалось найти sitekey для reCAPTCHA');
+            await takeDebugScreenshot(page, login, '03_7_no_sitekey');
+            throw new Error('reCAPTCHA sitekey not found');
+        }
+        
+        console.log(`🔑 Найден sitekey: ${sitekey}`);
+        
+        // Проверяем API ключ
+        if (!process.env.ANTICAPTCHA_API_KEY) {
+            console.error('❌ ANTICAPTCHA_API_KEY не настроен!');
+            await takeDebugScreenshot(page, login, '03_8_no_api_key');
+            throw new Error('AntiCaptcha API key not configured');
+        }
+        
+        try {
+            // Решаем капчу
+            const gresponse = await solveRecaptchaV2(page.url(), sitekey);
+            
+            // Вставляем решение
+            await page.evaluate((token: string) => {
+                const textarea = document.querySelector('textarea[name="g-recaptcha-response"]') as HTMLTextAreaElement;
+                if (textarea) {
+                    textarea.innerHTML = token;
+                    textarea.value = token;
+                    textarea.style.display = 'block';
+                }
+                
+                const input = document.querySelector('input[name="g-recaptcha-response"]') as HTMLInputElement;
+                if (input) {
+                    input.value = token;
+                }
+                
+                if (typeof (window as any).grecaptcha !== 'undefined') {
+                    const clients = (window as any).___grecaptcha_cfg?.clients;
+                    if (clients) {
+                        Object.keys(clients).forEach((key) => {
+                            const client = clients[key];
+                            if (client && client.callback) {
+                                client.callback(token);
+                            }
+                        });
+                    }
+                }
+            }, gresponse);
+            
+            console.log('✅ Решение reCAPTCHA вставлено');
+            await new Promise(r => setTimeout(r, 2000));
+            await takeDebugScreenshot(page, login, '03_9_recaptcha_solved');
+            
+            // После решения капчи должна появиться форма входа
+            console.log('⏳ Ожидание появления формы входа после решения капчи...');
+            await page.waitForSelector('input[name="sign"]', { visible: true, timeout: 15000 });
+            console.log('✅ Форма входа появилась после решения капчи');
+            
+        } catch (captchaError: any) {
+            console.error('❌ Ошибка при решении reCAPTCHA:', captchaError.message);
+            await takeDebugScreenshot(page, login, '03_8_captcha_error');
+            await browser.close();
+            throw new Error(`Failed to solve reCAPTCHA: ${captchaError.message}`);
+        }
+    } else {
+        console.log('✅ reCAPTCHA не обнаружена');
+        
+        // Проверяем, есть ли форма входа
+        const loginField = await page.$('input[name="sign"]');
+        if (!loginField) {
+            console.warn('⚠️ Форма входа не найдена, возможно страница загружается');
+            await takeDebugScreenshot(page, login, '03_6_no_form');
+            
+            // Ждём ещё 5 секунд
+            console.log('⏳ Дополнительное ожидание формы входа...');
+            await new Promise(r => setTimeout(r, 5000));
+            await takeDebugScreenshot(page, login, '03_7_after_additional_wait');
+        }
+    }
+
+} catch (e) {
+    console.error('❌ Ошибка загрузки страницы логина:', e);
+    await takeDebugScreenshot(page, login, '03_login_page_load_error');
+    await browser.close();
+    throw e;
+}
+
 
     // 3. Ввод логина и пароля
     const loginInputSelector = 'input[name="sign"]';
