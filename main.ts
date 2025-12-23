@@ -178,7 +178,7 @@ async function completeLoginFlow(login: string, code: string) {
         }
 
         // Ждем перехода
-        await page.waitForFunction(() => window.location.href.includes('/personal'), { timeout: 15000 });
+        await page.waitForFunction(() => window.location.href.includes('/personal'), { timeout: 30000 });
 
         console.log('🎉 Успешный вход!');
         clearTimeout(flow.timer);
@@ -326,7 +326,7 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
 
     const loginInputSelector = 'input[name="sign"]';
     try {
-        await page.waitForSelector(loginInputSelector, { visible: true, timeout: 15000 });
+        await page.waitForSelector(loginInputSelector, { visible: true, timeout: 30000 });
 
         // 📸 SCREENSHOT 4: Поле логина найдено
         await takeDebugScreenshot('04_login_field_found');
