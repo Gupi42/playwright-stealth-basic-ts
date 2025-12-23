@@ -274,7 +274,7 @@ if (codeInput || currentUrl.includes('/sign')) {
         try {
             console.log('📱 Способ 1: Ищем кнопку Telegram...');
             
-            const [telegramBtn] = await page.$x("//button[contains(normalize-space(.), 'Telegram') or contains(normalize-space(.), 'телеграм')]");
+            const [telegramBtn] = await page.$$("//button[contains(normalize-space(.), 'Telegram') or contains(normalize-space(.), 'телеграм')]");
             
             if (telegramBtn) {
                 console.log('✅ Найдена кнопка Telegram через XPath');
@@ -334,7 +334,7 @@ if (codeInput || currentUrl.includes('/sign')) {
         try {
             console.log('📱 Способ 3: Ищем любую ссылку с "Telegram"...');
             
-            const [telegramLink] = await page.$x("//a[contains(normalize-space(.), 'Telegram')]");
+            const [telegramLink] = await page.$$("//a[contains(normalize-space(.), 'Telegram')]");
             
             if (telegramLink) {
                 console.log('✅ Найдена ссылка с Telegram через XPath');
@@ -360,7 +360,7 @@ if (codeInput || currentUrl.includes('/sign')) {
         try {
             console.log('📱 Способ 4: Ищем кнопку "Получить СМС-код"...');
             
-            const [smsButton] = await page.$x("//button[contains(normalize-space(.), 'Получить СМС-код')]");
+            const [smsButton] = await page.$$("//button[contains(normalize-space(.), 'Получить СМС-код')]");
             
             if (smsButton) {
                 console.log('✅ Найдена кнопка "Получить СМС-код"');
