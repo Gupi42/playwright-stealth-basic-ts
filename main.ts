@@ -523,14 +523,85 @@ try {
                 }
             }, gresponse);
             
-            console.log('✅ Решение reCAPTCHA вставлено');
-            await new Promise(r => setTimeout(r, 2000));
-            await takeDebugScreenshot(page, login, '03_9_recaptcha_solved');
+console.log('✅ Решение reCAPTCHA вставлено');
+await new Promise(r => setTimeout(r, 1500));
+await takeDebugScreenshot(page, login, '03_9_recaptcha_solved');
+
+// Ищем форму/кнопку для submit
+console.log('📤 Поиск способа отправки формы капчи...');
+
+// Проверяем HTML страницы
+const pageHTML = await page.content();
+const hasForm = pageHTML.includes('<form');
+const hasSubmitButton = pageHTML.includes('type="submit"');
+
+console.log(`🔍 На странице: форма=${hasForm}, submit кнопка=${hasSubmitButton}`);
+
+let navigationOccurred = false;
+
+// Способ 1: Клик по кнопке submit
+if (hasSubmitButton) {
+    try {
+        const buttons = await page.$$('button[type="submit"]');
+        if (buttons.length > 0) {
+            console.log(`✅ Найдено ${buttons.length} submit кнопок`);
             
-            // После решения капчи должна появиться форма входа
-            console.log('⏳ Ожидание появления формы входа после решения капчи...');
-            await page.waitForSelector('input[name="sign"]', { visible: true, timeout: 15000 });
-            console.log('✅ Форма входа появилась после решения капчи');
+            await Promise.all([
+                buttons[0].click(),
+                page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 })
+                    .then(() => {
+                        navigationOccurred = true;
+                        console.log('✅ Навигация произошла после клика');
+                    })
+                    .catch(() => console.log('⚠️ Навигация не произошла'))
+            ]);
+        }
+    } catch (e) {
+        console.log('⚠️ Способ 1 не сработал');
+    }
+}
+
+// Способ 2: Submit формы напрямую
+if (!navigationOccurred && hasForm) {
+    try {
+        console.log('📝 Пробуем submit формы...');
+        
+        await Promise.all([
+            page.evaluate(() => {
+                const form = document.querySelector('form') as HTMLFormElement;
+                if (form) form.submit();
+            }),
+            page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 })
+                .then(() => {
+                    navigationOccurred = true;
+                    console.log('✅ Навигация произошла после form.submit()');
+                })
+                .catch(() => console.log('⚠️ Навигация не произошла'))
+        ]);
+    } catch (e) {
+        console.log('⚠️ Способ 2 не сработал');
+    }
+}
+
+// Способ 3: Переход напрямую
+if (!navigationOccurred) {
+    console.log('🔄 Форма не отправилась, переходим на /sign напрямую...');
+    await page.goto('https://my.drom.ru/sign', { 
+        waitUntil: 'domcontentloaded',
+        timeout: 30000 
+    });
+    await new Promise(r => setTimeout(r, 3000));
+}
+
+await takeDebugScreenshot(page, login, '03_10_after_captcha_submit');
+
+// Теперь должна быть форма входа
+const currentUrl = page.url();
+console.log(`📍 Текущий URL: ${currentUrl}`);
+
+// НЕ проверяем наличие формы здесь, просто продолжаем код
+// Проверка будет в блоке "Ввод логина и пароля"
+
             
         } catch (captchaError: any) {
             console.error('❌ Ошибка при решении reCAPTCHA:', captchaError.message);
