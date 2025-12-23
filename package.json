@@ -11,6 +11,7 @@
     "puppeteer": "^23.10.1",                  
     "puppeteer-extra": "^3.3.6",             
     "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "@antiadmin/anticaptchaofficial": "^1.0.55",
     "ghost-cursor": "^1.4.1",
     "typescript": "^5.3.3",
     "ts-node": "^10.9.2",
