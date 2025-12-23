@@ -11,7 +11,19 @@ puppeteer.use(StealthPlugin());
 
 const app = express();
 app.use(express.json());
-
+// Хелпер для парсинга прокси
+function parseProxy(proxyUrl: string) {
+    try {
+        const url = new URL(proxyUrl);
+        return {
+            server: `${url.protocol}//${url.hostname}:${url.port}`,
+            username: url.username,
+            password: url.password
+        };
+    } catch (e) {
+        return null;
+    }
+}
 // === 🛡️ ЗАЩИТА (MIDDLEWARE) ===
 app.use((req, res, next) => {
     if (req.path === '/health') return next();
@@ -199,6 +211,26 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
     const browser = await getBrowserInstance(proxyServerArg);
     const page = await browser.newPage();
 
+    // 📸 HELPER: Функция для создания скриншотов
+    async function takeDebugScreenshot(step: string) {
+        try {
+            const timestamp = Date.now();
+            const sanitizedLogin = login.replace(/[^a-zA-Z0-9]/g, '_');
+            const filename = `${sanitizedLogin}_${step}_${timestamp}.png`;
+            const filepath = path.join(DEBUG_DIR, filename);
+
+            await page.screenshot({ 
+                path: filepath, 
+                fullPage: true 
+            });
+
+            console.log(`📸 Скриншот сохранен: ${filename}`);
+            return filename;
+        } catch (e) {
+            console.error(`⚠️ Ошибка создания скриншота на этапе ${step}:`, e);
+        }
+    }
+
     // ВАЖНО: Авторизация на прокси
     if (proxyConfig && proxyConfig.username && proxyConfig.password) {
         console.log('🔑 Авторизация на прокси...');
@@ -207,7 +239,7 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
             password: proxyConfig.password
         });
     }
-    
+
     await page.setViewport({ width: 1366, height: 768 });
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36');
 
@@ -222,6 +254,9 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
         }
     });
 
+    // 📸 SCREENSHOT 1: После инициализации
+    await takeDebugScreenshot('01_initialized');
+
     // 1. Попытка восстановить сессию
     const sessionPath = getSessionPath(login);
     if (fs.existsSync(sessionPath)) {
@@ -234,10 +269,7 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
                 if (state.cookies && Array.isArray(state.cookies)) {
                     await page.setCookie(...state.cookies);
                 }
-                
-                // LocalStorage restore logic if needed (complex in puppeteer without context)
-                // Puppeteer не имеет метода addInitScript как Playwright в явном виде для контекста,
-                // но можно использовать evaluateOnNewDocument
+
                 if (state.localStorage) {
                      await page.evaluateOnNewDocument((data: any) => {
                         localStorage.clear();
@@ -246,17 +278,25 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
                 }
 
                 console.log(`🔄 Пробуем восстановить сессию для ${login}...`);
-                
+
                 try {
-                   await page.goto('https://my.drom.ru/personal/', { waitUntil: 'domcontentloaded', timeout: 60000 });
-                   
+                   await page.goto('https://my.drom.ru/personal/', { 
+                       waitUntil: 'domcontentloaded', 
+                       timeout: 60000 
+                   });
+
+                   // 📸 SCREENSHOT 2: После попытки восстановления сессии
+                   await takeDebugScreenshot('02_session_restore_attempt');
+
                    // Проверка, не выкинуло ли на логин
                    if (!page.url().includes('sign')) {
                         console.log('✅ Сессия восстановлена');
+                        await takeDebugScreenshot('03_session_restored_success');
                         return { success: true, browser, page };
                    }
                 } catch(e) {
                    console.log('⚠️ Ошибка при переходе с куками:', e);
+                   await takeDebugScreenshot('02_session_restore_error');
                 }
             }
             console.log('⚠️ Сессия устарела или невалидна, нужен ре-логин');
@@ -267,52 +307,90 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
 
     // 2. Вход с паролем
     console.log('🔐 Входим по логину/паролю...');
-    await page.goto('https://my.drom.ru/sign', { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+    try {
+        await page.goto('https://my.drom.ru/sign', { 
+            waitUntil: 'domcontentloaded', 
+            timeout: 60000 
+        });
+
+        // 📸 SCREENSHOT 3: Страница логина загружена
+        await takeDebugScreenshot('03_login_page_loaded');
+
+    } catch (e) {
+        console.error('❌ Ошибка загрузки страницы логина:', e);
+        await takeDebugScreenshot('03_login_page_load_error');
+        await browser.close();
+        throw e;
+    }
 
     const loginInputSelector = 'input[name="sign"]';
     try {
         await page.waitForSelector(loginInputSelector, { visible: true, timeout: 15000 });
+
+        // 📸 SCREENSHOT 4: Поле логина найдено
+        await takeDebugScreenshot('04_login_field_found');
+
         await page.type(loginInputSelector, login, { delay: 100 });
         await new Promise(r => setTimeout(r, 300));
-        
+
+        // 📸 SCREENSHOT 5: Логин введен
+        await takeDebugScreenshot('05_login_entered');
+
         await page.type('input[type="password"]', password, { delay: 100 });
         await new Promise(r => setTimeout(r, 500));
 
+        // 📸 SCREENSHOT 6: Пароль введен
+        await takeDebugScreenshot('06_password_entered');
+
         // Ищем кнопку "Войти с паролем"
-        // Puppeteer не имеет псевдо-селекторов :has-text, используем xpath или evaluate
         const [button] = await page.$$("xpath/.//button[contains(., 'Войти с паролем')]");
         if (button) {
             await button.click();
+            console.log('✅ Кнопка "Войти с паролем" нажата');
         } else {
              // Fallback если текст другой
              await page.click('button[type="submit"]');
+             console.log('✅ Кнопка submit нажата (fallback)');
         }
 
         await new Promise(r => setTimeout(r, 3000));
-        
+
+        // 📸 SCREENSHOT 7: После нажатия кнопки входа
+        await takeDebugScreenshot('07_after_login_click');
+
     } catch (e) {
-        console.error("Ошибка при вводе логина:", e);
+        console.error("❌ Ошибка при вводе логина:", e);
+        await takeDebugScreenshot('08_login_input_error');
         await browser.close();
         throw e;
     }
 
     // 3. Проверка 2FA
     const currentUrl = page.url();
-    // const bodyText = await page.$eval('body', (el:any) => el.innerText); 
-    // ^ это может быть долго, проще проверить наличие элементов
-    
+    console.log(`📍 Текущий URL: ${currentUrl}`);
+
+    // 📸 SCREENSHOT 8: Проверка на 2FA
+    await takeDebugScreenshot('08_checking_2fa');
+
     // Проверяем наличие поля ввода кода
     const codeInput = await page.$('input[name="code"]');
-    
+
     if (codeInput || currentUrl.includes('/sign')) { 
-        // Если мы все еще на /sign и есть намек на код
         console.log('📱 Drom запрашивает код подтверждения');
-        
-        // Поиск кнопки отправить код (если она есть)
+
+        // 📸 SCREENSHOT 9: Требуется верификация
+        await takeDebugScreenshot('09_verification_required');
+
+        // Поиск кнопки отправить код
         const [sendBtn] = await page.$$("xpath/.//div[contains(text(), 'Отправить код')] | //button[contains(text(), 'Отправить код')]");
         if (sendBtn) {
             await sendBtn.click();
-            console.log('SMS запрошена');
+            console.log('📤 SMS запрошена');
+            await new Promise(r => setTimeout(r, 2000));
+
+            // 📸 SCREENSHOT 10: После запроса SMS
+            await takeDebugScreenshot('10_sms_requested');
         }
 
         activeFlows.set(login, {
@@ -328,6 +406,10 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
             message: 'Требуется код подтверждения. Отправьте его в следующем запросе.'
         };
     }
+
+    // 📸 SCREENSHOT 11: Успешный вход
+    await takeDebugScreenshot('11_login_success');
+    console.log('✅ Вход выполнен успешно');
 
     return { success: true, browser, page };
 }
@@ -373,19 +455,6 @@ async function getBrowserInstance(proxyServer?: string) {
     }
 
     return await puppeteer.launch(launchOptions);
-}
-// Хелпер для парсинга прокси
-function parseProxy(proxyUrl: string) {
-    try {
-        const url = new URL(proxyUrl);
-        return {
-            server: `${url.protocol}//${url.hostname}:${url.port}`,
-            username: url.username,
-            password: url.password
-        };
-    } catch (e) {
-        return null;
-    }
 }
 
 // 🆕 УЛУЧШЕННАЯ ФУНКЦИЯ ОЧИСТКИ КОНТЕКСТА ПЕРЕД ЗАГРУЗКОЙ НОВОЙ СЕССИИ
