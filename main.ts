@@ -355,6 +355,38 @@ async function humanClick(page: any, selector: string) {
     }
     return false;
 }
+async function getBrowserInstance(proxyServer?: string) {
+    const launchOptions: any = {
+        headless: "new",
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--window-size=1366,768'
+        ],
+        ignoreHTTPSErrors: true,
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH
+    };
+
+    if (proxyServer) {
+        launchOptions.args.push(`--proxy-server=${proxyServer}`);
+    }
+
+    return await puppeteer.launch(launchOptions);
+}
+// Хелпер для парсинга прокси
+function parseProxy(proxyUrl: string) {
+    try {
+        const url = new URL(proxyUrl);
+        return {
+            server: `${url.protocol}//${url.hostname}:${url.port}`,
+            username: url.username,
+            password: url.password
+        };
+    } catch (e) {
+        return null;
+    }
+}
 
 // 🆕 УЛУЧШЕННАЯ ФУНКЦИЯ ОЧИСТКИ КОНТЕКСТА ПЕРЕД ЗАГРУЗКОЙ НОВОЙ СЕССИИ
 async function clearBrowserContext(page: any): Promise<void> {
