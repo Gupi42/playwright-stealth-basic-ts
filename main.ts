@@ -866,6 +866,52 @@ app.post('/drom/send-offer', async (req: Request, res: Response) => {
 });
 
 app.get('/health', (_, res) => res.send('OK'));
+// Список всех скриншотов
+app.get('/debug/screenshots', async (req: Request, res: Response) => {
+    const apiKey = req.headers['x-api-key'];
+    if (apiKey !== process.env.API_SECRET) {
+        return res.status(403).json({ error: 'Access denied' });
+    }
 
+    try {
+        const files = fs.readdirSync(DEBUG_DIR);
+        const screenshots = files
+            .filter(f => f.endsWith('.png'))
+            .map(f => {
+                const stats = fs.statSync(path.join(DEBUG_DIR, f));
+                return {
+                    filename: f,
+                    size: stats.size,
+                    created: stats.birthtime
+                };
+            })
+            .sort((a, b) => b.created.getTime() - a.created.getTime());
+        
+        res.json({ screenshots });
+    } catch (e: any) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Скачать конкретный скриншот
+app.get('/debug/screenshot/:filename', async (req: Request, res: Response) => {
+    const apiKey = req.headers['x-api-key'];
+    if (apiKey !== process.env.API_SECRET) {
+        return res.status(403).json({ error: 'Access denied' });
+    }
+
+    try {
+        const filename = req.params.filename;
+        const filepath = path.join(DEBUG_DIR, filename);
+        
+        if (!fs.existsSync(filepath)) {
+            return res.status(404).send('File not found');
+        }
+        
+        res.sendFile(filepath);
+    } catch (e: any) {
+        res.status(500).json({ error: e.message });
+    }
+});
 const PORT = Number(process.env.PORT) || 3000;
 app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server on port ${PORT}`));
