@@ -479,7 +479,7 @@ if (codeInput || currentUrl.includes('/sign')) {
 
     // Способ 1: Текст содержит "Отправить код"
     try {
-        const [sendBtn1] = await page.$x("//button[contains(text(), 'Отправить код')]");
+        const [sendBtn1] = await page.$$("//button[contains(text(), 'Отправить код')]");
         if (sendBtn1) {
             console.log('✅ Найдена кнопка через XPath (contains "Отправить код")');
             await sendBtn1.click();
@@ -493,7 +493,7 @@ if (codeInput || currentUrl.includes('/sign')) {
     // Способ 2: Если не нашли, ищем по частичному тексту "телефон"
     if (!smsButtonClicked) {
         try {
-            const [sendBtn2] = await page.$x("//button[contains(text(), 'телефон')]");
+            const [sendBtn2] = await page.$$("//button[contains(text(), 'телефон')]");
             if (sendBtn2) {
                 console.log('✅ Найдена кнопка через XPath (contains "телефон")');
                 await sendBtn2.click();
