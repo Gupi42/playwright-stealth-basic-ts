@@ -191,6 +191,34 @@ async function completeLoginFlow(login: string, code: string) {
         throw new Error('Неверный код или ошибка сайта');
     }
 }
+async function loadPageWithRetry(page: any, url: string, options: any = {}, maxRetries: number = 3) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            console.log(`🔄 Попытка ${attempt}/${maxRetries} загрузить ${url}`);
+            
+            await page.goto(url, {
+                waitUntil: 'domcontentloaded',
+                timeout: 60000,
+                ...options
+            });
+            
+            console.log(`✅ Страница загружена с попытки ${attempt}`);
+            return; // Успех
+            
+        } catch (error: any) {
+            console.error(`❌ Попытка ${attempt} не удалась:`, error.message);
+            
+            if (attempt === maxRetries) {
+                throw error; // Исчерпаны попытки
+            }
+            
+            // Пауза перед повтором (увеличивается с каждой попыткой)
+            const delay = attempt * 3000; // 3, 6, 9 секунд
+            console.log(`⏳ Ожидание ${delay/1000} секунд перед повтором...`);
+            await new Promise(r => setTimeout(r, delay));
+        }
+    }
+}
 
 async function startLoginFlow(login: string, password: string, proxyUrl?: string) {
     await cleanupFlow(login);
@@ -244,15 +272,15 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36');
 
     // // Блокировка ресурсов
-    // await page.setRequestInterception(true);
-    // page.on('request', (req: any) => {
-    //     const type = req.resourceType();
-    //     if (['image', 'font', 'media', 'stylesheet'].includes(type)) {
-    //         req.abort();
-    //     } else {
-    //         req.continue();
-    //     }
-    // });
+    await page.setRequestInterception(true);
+    page.on('request', (req: any) => {
+        const type = req.resourceType();
+        if (['image', 'font', 'media', 'stylesheet'].includes(type)) {
+            req.abort();
+        } else {
+            req.continue();
+        }
+    });
 
     // 📸 SCREENSHOT 1: После инициализации
     await takeDebugScreenshot('01_initialized');
@@ -309,10 +337,20 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
     console.log('🔐 Входим по логину/паролю...');
 
     try {
-        await page.goto('https://my.drom.ru/sign', { 
-            waitUntil: 'domcontentloaded', 
-            timeout: 60000 
-        });
+        // await page.goto('https://my.drom.ru/sign', { 
+        //     waitUntil: 'domcontentloaded', 
+        //     timeout: 60000 
+        // });
+        await loadPageWithRetry(page, 'https://my.drom.ru/sign');
+// Проверяем размер контента
+const content = await page.content();
+if (content.length < 10000) {
+    console.warn(`⚠️ Подозрительно маленькая страница: ${content.length} байт`);
+    await takeDebugScreenshot('03_suspicious_small_page');
+    throw new Error('Прокси вернул неполную страницу');
+}
+
+await takeDebugScreenshot('03_login_page_loaded');
 
         // 📸 SCREENSHOT 3: Страница логина загружена
         await takeDebugScreenshot('03_login_page_loaded');
