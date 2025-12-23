@@ -643,12 +643,14 @@ app.post('/drom/logout', async (req: Request, res: Response) => {
 // --- РОУТЫ ---
 
 // 1. ПОЛУЧЕНИЕ СООБЩЕНИЙ
+// 1. ПОЛУЧЕНИЕ СООБЩЕНИЙ
 app.post('/drom/get-messages', async (req: Request, res: Response) => {
     const { login, password, verificationCode, proxy } = req.body;
     if (!login || !password) return res.status(400).json({ error: 'Login/password required' });
 
     let browserData;
     try {
+        // Вход или завершение 2FA
         if (verificationCode) {
             browserData = await completeLoginFlow(login, verificationCode);
         } else {
@@ -659,93 +661,209 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
 
         const { page, browser } = browserData;
         console.log('💬 Загрузка списка диалогов...');
-        
-        await page.goto('https://my.drom.ru/personal/messaging-modal?switchPosition=dialogs', { waitUntil: 'domcontentloaded', timeout: 60000 });
-        await new Promise(r => setTimeout(r, 3000));  // 🆕 Ждем 3 секунды стабилизации
+
+        // Переход на страницу диалогов с более надежным ожиданием
+        await page.goto('https://my.drom.ru/personal/messaging-modal?switchPosition=dialogs', { 
+            waitUntil: 'networkidle0',  // Ждем полной загрузки без активных запросов
+            timeout: 60000 
+        });
+
+        // Ждем стабилизации страницы
+        await new Promise(r => setTimeout(r, 3000));
+
+        // Проверяем, не произошел ли редирект на страницу входа
+        const currentUrl = page.url();
+        console.log(`📍 Текущий URL: ${currentUrl}`);
+
+        if (currentUrl.includes('/sign')) {
+            console.log('⚠️ Сессия истекла, требуется повторный вход');
+            await takeDebugScreenshot(page, login, 'session_expired_dialogs');
+            await browser.close();
+            return res.status(401).json({ 
+                success: false, 
+                error: 'Session expired, please login again' 
+            });
+        }
+
+        // Ждем появления списка диалогов
         try {
             await page.waitForSelector('.dialog-list__li', { timeout: 10000 });
+            console.log('✅ Список диалогов загружен');
         } catch {
-            console.log('Диалогов нет');
+            console.log('📭 Диалогов нет');
+            await takeDebugScreenshot(page, login, 'no_dialogs');
             await saveStateAndClose(login, browser, page);
             return res.json({ success: true, count: 0, dialogs: [] });
         }
 
-        const dialogsList = await page.evaluate(() => {
-            return Array.from(document.querySelectorAll('.dialog-list__li'))
-                .map(el => {
-                    const href = el.querySelector('a[href*="/messaging/view"]')?.getAttribute('href');
-                    const match = href?.match(/dialogId=([^&]+)/);
-                    return match ? { dialogId: match[1] } : null;
-                })
-                .filter(Boolean);
-        });
+        // Извлекаем список dialogId с защитой от ошибок context
+        let dialogsList;
+        try {
+            dialogsList = await page.evaluate(() => {
+                return Array.from(document.querySelectorAll('.dialog-list__li'))
+                    .map(el => {
+                        const href = el.querySelector('a[href*="/messaging/view"]')?.getAttribute('href');
+                        const match = href?.match(/dialogId=([^&]+)/);
+                        return match ? { dialogId: match[1] } : null;
+                    })
+                    .filter(Boolean);
+            });
+            console.log(`📋 Найдено диалогов: ${dialogsList.length}`);
+        } catch (e: any) {
+            console.error('❌ Ошибка при извлечении списка диалогов:', e.message);
+            await takeDebugScreenshot(page, login, 'error_extract_dialogs');
+            await browser.close();
+            return res.status(500).json({ 
+                success: false, 
+                error: 'Failed to extract dialog list: ' + e.message 
+            });
+        }
+
+        if (!dialogsList || dialogsList.length === 0) {
+            console.log('📭 Список диалогов пуст');
+            await saveStateAndClose(login, browser, page);
+            return res.json({ success: true, count: 0, dialogs: [] });
+        }
 
         const limit = Math.min(dialogsList.length, 10);
-        console.log(`📋 Обработка ${limit} диалогов...`);
+        console.log(`📋 Обработка ${limit} из ${dialogsList.length} диалогов...`);
         const detailedDialogs = [];
 
+        // Обрабатываем каждый диалог
         for (let i = 0; i < limit; i++) {
             const dItem: any = dialogsList[i];
+
             try {
-                // В Puppeteer сложнее кликнуть по конкретному элементу из списка, проще перейти по URL
-                await page.goto(`https://my.drom.ru/personal/messaging/view?dialogId=${dItem.dialogId}`, { waitUntil: 'domcontentloaded' });
-                
-                try {
-                     await page.waitForSelector('.bzr-dialog__inner', { timeout: 8000 });
-                } catch(e) { continue; }
+                console.log(`🔄 Обработка диалога ${i + 1}/${limit} (ID: ${dItem.dialogId})...`);
 
-                const details = await page.evaluate(() => {
-                    const carLink = document.querySelector('.bzr-dialog-header__sub-title a');
-                    const carTitle = carLink?.textContent?.trim() || '';
-                    let carUrl = carLink?.getAttribute('href') || '';
-                    if (carUrl && carUrl.startsWith('//')) carUrl = 'https:' + carUrl;
-
-                    const allMessages = Array.from(document.querySelectorAll('.bzr-dialog__message'));
-                    const buffer: string[] = [];
-                    let lastTime = '';
-
-                    for (let j = allMessages.length - 1; j >= 0; j--) {
-                        const msg = allMessages[j];
-                        if (msg.classList.contains('bzr-dialog__message_out')) {
-                            break;
-                        }
-                        if (msg.classList.contains('bzr-dialog__message_in')) {
-                            const text = msg.querySelector('.bzr-dialog__text')?.textContent?.trim() || '';
-                            if (text) buffer.unshift(text);
-                            if (!lastTime) {
-                                lastTime = msg.querySelector('.bzr-dialog__message-dt')?.textContent?.trim() || '';
-                            }
-                        }
-                    }
-
-                    const combinedText = buffer.join('\n');
-                    return {
-                        carTitle,
-                        carUrl,
-                        lastIncomingText: combinedText,
-                        lastIncomingTime: lastTime
-                    };
+                // Переход на страницу конкретного диалога
+                await page.goto(`https://my.drom.ru/personal/messaging/view?dialogId=${dItem.dialogId}`, { 
+                    waitUntil: 'networkidle0',
+                    timeout: 30000 
                 });
 
-                if (details.lastIncomingText) {
-                    detailedDialogs.push({ dialogId: dItem.dialogId, ...details });
+                // Небольшая задержка для стабилизации
+                await new Promise(r => setTimeout(r, 1500));
+
+                // Проверяем редирект
+                if (page.url().includes('/sign')) {
+                    console.log('⚠️ Сессия истекла во время обработки диалога');
+                    break;
                 }
 
-                await new Promise(r => setTimeout(r, Math.random() * 1000 + 500));
+                // Ждем загрузки контента диалога
+                try {
+                    await page.waitForSelector('.bzr-dialog__inner', { timeout: 8000 });
+                } catch(e) { 
+                    console.log(`⚠️ Диалог ${dItem.dialogId} не загрузился, пропускаем`);
+                    continue; 
+                }
 
-            } catch (e) {
-                console.error(`Error dialog ${dItem.dialogId}`, e);
+                // Извлекаем детали диалога с защитой
+                let details;
+                try {
+                    details = await page.evaluate(() => {
+                        const carLink = document.querySelector('.bzr-dialog-header__sub-title a');
+                        const carTitle = carLink?.textContent?.trim() || '';
+                        let carUrl = carLink?.getAttribute('href') || '';
+                        if (carUrl && carUrl.startsWith('//')) carUrl = 'https:' + carUrl;
+
+                        const allMessages = Array.from(document.querySelectorAll('.bzr-dialog__message'));
+                        const buffer: string[] = [];
+                        let lastTime = '';
+
+                        // Собираем последние входящие сообщения (до первого исходящего)
+                        for (let j = allMessages.length - 1; j >= 0; j--) {
+                            const msg = allMessages[j];
+
+                            // Если встретили исходящее - останавливаемся
+                            if (msg.classList.contains('bzr-dialog__message_out')) {
+                                break;
+                            }
+
+                            // Собираем входящие
+                            if (msg.classList.contains('bzr-dialog__message_in')) {
+                                const text = msg.querySelector('.bzr-dialog__text')?.textContent?.trim() || '';
+                                if (text) buffer.unshift(text);
+
+                                if (!lastTime) {
+                                    lastTime = msg.querySelector('.bzr-dialog__message-dt')?.textContent?.trim() || '';
+                                }
+                            }
+                        }
+
+                        const combinedText = buffer.join('\n');
+                        return {
+                            carTitle,
+                            carUrl,
+                            lastIncomingText: combinedText,
+                            lastIncomingTime: lastTime
+                        };
+                    });
+                } catch (e: any) {
+                    console.error(`❌ Ошибка при извлечении данных диалога ${dItem.dialogId}:`, e.message);
+                    if (e.message.includes('Execution context was destroyed')) {
+                        console.log('⚠️ Context destroyed, возможно произошел редирект');
+                        await takeDebugScreenshot(page, login, `dialog_${dItem.dialogId}_context_error`);
+                        break; // Прерываем цикл
+                    }
+                    continue; // Пропускаем этот диалог
+                }
+
+                // Добавляем в результат только если есть текст
+                if (details && details.lastIncomingText) {
+                    detailedDialogs.push({ 
+                        dialogId: dItem.dialogId, 
+                        ...details 
+                    });
+                    console.log(`✅ Диалог ${dItem.dialogId} обработан`);
+                } else {
+                    console.log(`⚠️ Диалог ${dItem.dialogId} пуст, пропускаем`);
+                }
+
+                // Случайная задержка между диалогами (имитация человека)
+                await new Promise(r => setTimeout(r, Math.random() * 1500 + 1000));
+
+            } catch (e: any) {
+                console.error(`❌ Критическая ошибка при обработке диалога ${dItem.dialogId}:`, e.message);
+                await takeDebugScreenshot(page, login, `dialog_${dItem.dialogId}_critical_error`);
+                // Продолжаем со следующим диалогом
+                continue;
             }
         }
 
-        console.log(`✅ Собрано ${detailedDialogs.length}`);
+        console.log(`✅ Успешно собрано диалогов: ${detailedDialogs.length} из ${limit}`);
+
+        // Сохраняем сессию и закрываем браузер
         await saveStateAndClose(login, browser, page);
-        res.json({ success: true, count: detailedDialogs.length, dialogs: detailedDialogs });
+
+        res.json({ 
+            success: true, 
+            count: detailedDialogs.length, 
+            dialogs: detailedDialogs 
+        });
 
     } catch (err: any) {
-        console.error('CRITICAL ERROR:', err.message);
-        if (browserData?.browser) await browserData.browser.close().catch(() => {});
-        res.status(500).json({ success: false, error: err.message });
+        console.error('🚨 CRITICAL ERROR в /drom/get-messages:', err.message);
+        console.error('Stack:', err.stack);
+
+        // Делаем скриншот при критической ошибке
+        if (browserData?.page) {
+            try {
+                await takeDebugScreenshot(browserData.page, login, 'critical_error_get_messages');
+            } catch {}
+        }
+
+        // Закрываем браузер
+        if (browserData?.browser) {
+            await browserData.browser.close().catch(() => {});
+        }
+
+        res.status(500).json({ 
+            success: false, 
+            error: err.message,
+            details: 'Check server logs for full error details'
+        });
     }
 });
 
