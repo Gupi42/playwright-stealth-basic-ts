@@ -617,7 +617,7 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
 
         // Способ 1: XPath с "Отправить код"
         try {
-            const [sendBtn1] = await page.$x("//button[contains(text(), 'Отправить код')]");
+            const [sendBtn1] = await page.$$("//button[contains(text(), 'Отправить код')]");
             if (sendBtn1) {
                 console.log('✅ Найдена кнопка через XPath (contains "Отправить код")');
                 await sendBtn1.click();
@@ -631,7 +631,7 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
         // Способ 2: XPath с "телефон"
         if (!smsButtonClicked) {
             try {
-                const [sendBtn2] = await page.$x("//button[contains(text(), 'телефон')]");
+                const [sendBtn2] = await page.$$("//button[contains(text(), 'телефон')]");
                 if (sendBtn2) {
                     console.log('✅ Найдена кнопка через XPath (contains "телефон")');
                     await sendBtn2.click();
@@ -735,36 +735,6 @@ async function getBrowserInstance(proxyServer?: string) {
     }
 
     return await puppeteer.launch(launchOptions);
-}
-async function setupAntiDetection(page: any) {
-    await page.evaluateOnNewDocument(() => {
-        // Удаляем webdriver property
-        Object.defineProperty(navigator, 'webdriver', {
-            get: () => false,
-        });
-
-        // Переопределяем permissions
-        const originalQuery = window.navigator.permissions.query;
-        window.navigator.permissions.query = (parameters: any) => (
-            parameters.name === 'notifications' ?
-                Promise.resolve({ state: Notification.permission } as PermissionStatus) :
-                originalQuery(parameters)
-        );
-
-        // Добавляем chrome object
-        (window as any).chrome = {
-            runtime: {},
-        };
-
-        // Маскируем plugins и languages
-        Object.defineProperty(navigator, 'plugins', {
-            get: () => [1, 2, 3, 4, 5],
-        });
-
-        Object.defineProperty(navigator, 'languages', {
-            get: () => ['ru-RU', 'ru', 'en-US', 'en'],
-        });
-    });
 }
 
 // 🆕 УЛУЧШЕННАЯ ФУНКЦИЯ ОЧИСТКИ КОНТЕКСТА ПЕРЕД ЗАГРУЗКОЙ НОВОЙ СЕССИИ
