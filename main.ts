@@ -759,7 +759,7 @@ if (codeInput || currentUrl.includes('/sign')) {
         try {
             console.log('🎯 Способ 2: XPath с точным текстом');
             
-            const [smsLink] = await page.$x("//a[contains(@class, 'bzr-btn') and contains(normalize-space(.), 'Отправить код на телефон')]");
+            const [smsLink] = await page.$$("//a[contains(@class, 'bzr-btn') and contains(normalize-space(.), 'Отправить код на телефон')]");
             
             if (smsLink) {
                 console.log('✅ Найдена ссылка через XPath');
