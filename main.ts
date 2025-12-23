@@ -701,8 +701,7 @@ console.log(`📍 Текущий URL: ${currentUrl}`);
         throw e;
     }
 
-    // 4. Проверка 2FA
-    // 4. Проверка 2FA
+// 4. Проверка 2FA
 const currentUrl = page.url();
 console.log(`📍 Текущий URL: ${currentUrl}`);
 await takeDebugScreenshot(page, login, '08_checking_2fa');
@@ -713,246 +712,163 @@ if (codeInput || currentUrl.includes('/sign')) {
     console.log('📱 Drom запрашивает код подтверждения');
     await takeDebugScreenshot(page, login, '09_verification_required');
 
-    // 🆕 ДЕБАГ: Вывод всех кнопок И ссылок на странице
-    const clickablesDebug = await page.evaluate(() => {
-        const buttons = Array.from(document.querySelectorAll('button'));
-        const links = Array.from(document.querySelectorAll('a'));
-        
-        return {
-            buttons: buttons.map((btn, idx) => ({
-                type: 'button',
-                index: idx,
-                text: btn.textContent?.trim().replace(/\s+/g, ' '),
-                htmlType: btn.getAttribute('type'),
-                class: btn.getAttribute('class'),
-                visible: btn.offsetWidth > 0 && btn.offsetHeight > 0
-            })),
-            links: links.map((link, idx) => ({
-                type: 'link',
-                index: idx,
-                text: link.textContent?.trim().replace(/\s+/g, ' '),
-                href: link.getAttribute('href'),
-                class: link.getAttribute('class'),
-                visible: link.offsetWidth > 0 && link.offsetHeight > 0
-            }))
-        };
-    });
-    
-    console.log('🔍 ДЕБАГ: Кнопки на странице:', JSON.stringify(clickablesDebug.buttons, null, 2));
-    console.log('🔍 ДЕБАГ: Ссылки на странице:', JSON.stringify(clickablesDebug.links, null, 2));
-
-    // Поиск кнопки/ссылки отправки SMS
+    // Поиск и клик по кнопке/ссылке SMS
     console.log('📤 Ищем кнопку/ссылку отправки кода...');
     
     let smsButtonClicked = false;
 
-    // ========== ПОИСК КНОПОК ==========
-    
-    // Способ 1: Button с "Отправить код на телефон"
-    if (!smsButtonClicked) {
-        try {
-            const [sendBtn] = await page.$$("//button[contains(normalize-space(.), 'Отправить код на телефон')]");
-            if (sendBtn) {
-                console.log('✅ Способ 1: Button "Отправить код на телефон"');
-                await sendBtn.click();
-                smsButtonClicked = true;
-            }
-        } catch (e) {
-            console.log('⚠️ Способ 1 не сработал');
-        }
-    }
-
-    // Способ 2: Button с "телефон"
-    if (!smsButtonClicked) {
-        try {
-            const [sendBtn] = await page.$$("//button[contains(normalize-space(.), 'телефон')]");
-            if (sendBtn) {
-                console.log('✅ Способ 2: Button с "телефон"');
-                await sendBtn.click();
-                smsButtonClicked = true;
-            }
-        } catch (e) {
-            console.log('⚠️ Способ 2 не сработал');
-        }
-    }
-
-    // ========== ПОИСК ССЫЛОК ==========
-    
-    // Способ 3: Ссылка <a> с "Отправить код на телефон"
-    if (!smsButtonClicked) {
-        try {
-            const [sendLink] = await page.$$("//a[contains(normalize-space(.), 'Отправить код на телефон')]");
-            if (sendLink) {
-                console.log('✅ Способ 3: Link "Отправить код на телефон"');
-                await sendLink.click();
-                smsButtonClicked = true;
-            }
-        } catch (e) {
-            console.log('⚠️ Способ 3 не сработал');
-        }
-    }
-
-    // Способ 4: Ссылка <a> с "телефон"
-    if (!smsButtonClicked) {
-        try {
-            const [sendLink] = await page.$$("//a[contains(normalize-space(.), 'телефон')]");
-            if (sendLink) {
-                console.log('✅ Способ 4: Link с "телефон"');
-                await sendLink.click();
-                smsButtonClicked = true;
-            }
-        } catch (e) {
-            console.log('⚠️ Способ 4 не сработал');
-        }
-    }
-
-    // Способ 5: Ссылка <a> с "Отправить"
-    if (!smsButtonClicked) {
-        try {
-            const [sendLink] = await page.$$("//a[contains(normalize-space(.), 'Отправить')]");
-            if (sendLink) {
-                console.log('✅ Способ 5: Link с "Отправить"');
-                await sendLink.click();
-                smsButtonClicked = true;
-            }
-        } catch (e) {
-            console.log('⚠️ Способ 5 не сработал');
-        }
-    }
-
-    // ========== УНИВЕРСАЛЬНЫЙ ПОИСК ==========
-    
-    // Способ 6: Вторая кнопка на странице (первая обычно Telegram)
-    if (!smsButtonClicked) {
-        try {
-            const buttons = await page.$$('button');
-            if (buttons.length >= 2) {
-                const secondButton = buttons[1];
-                const buttonText = await page.evaluate(el => el.textContent?.trim(), secondButton);
-                console.log(`✅ Способ 6: Вторая кнопка: "${buttonText}"`);
-                await secondButton.click();
-                smsButtonClicked = true;
-            }
-        } catch (e) {
-            console.log('⚠️ Способ 6 не сработал');
-        }
-    }
-
-    // Способ 7: Серая ссылка (вторая на странице)
-    if (!smsButtonClicked) {
-        try {
-            const links = await page.$$('a');
-            
-            // Ищем ссылки с нужным текстом
-            for (let i = 0; i < links.length; i++) {
-                const link = links[i];
-                const linkText = await page.evaluate(el => el.textContent?.trim().toLowerCase(), link);
-                
-                if (linkText && 
-                    (linkText.includes('телефон') || 
-                     linkText.includes('отправить код') ||
-                     linkText.includes('sms'))) {
-                    
-                    console.log(`✅ Способ 7: Ссылка с нужным текстом: "${linkText}"`);
-                    await link.click();
-                    smsButtonClicked = true;
-                    break;
-                }
-            }
-        } catch (e) {
-            console.log('⚠️ Способ 7 не сработал');
-        }
-    }
-
-    // Способ 8: Универсальный - любой кликабельный элемент
-    if (!smsButtonClicked) {
-        try {
-            console.log('🔍 Способ 8: Ищем любой кликабельный элемент с нужным текстом...');
-            
-            const clickableElements = await page.evaluate(() => {
-                const elements: Array<{text: string, tag: string, index: number}> = [];
-                
-                // Собираем все кнопки и ссылки
-                document.querySelectorAll('button, a').forEach((el, idx) => {
-                    const text = el.textContent?.trim().toLowerCase() || '';
-                    if (text) {
-                        elements.push({
-                            text: text,
-                            tag: el.tagName.toLowerCase(),
-                            index: idx
-                        });
-                    }
-                });
-                
-                return elements;
-            });
-            
-            console.log('🔍 Все кликабельные элементы:', JSON.stringify(clickableElements, null, 2));
-            
-            // Ищем элемент с нужным текстом
-            const targetElement = await page.evaluate(() => {
-                const elements = Array.from(document.querySelectorAll('button, a'));
-                
-                for (const el of elements) {
-                    const text = el.textContent?.trim().toLowerCase() || '';
-                    if (text.includes('телефон') || 
-                        text.includes('отправить код') ||
-                        text.includes('sms')) {
-                        return {
-                            found: true,
-                            tag: el.tagName.toLowerCase(),
-                            text: el.textContent?.trim()
-                        };
-                    }
-                }
-                return { found: false };
-            });
-            
-            if (targetElement.found) {
-                console.log(`✅ Способ 8: Найден элемент <${targetElement.tag}>: "${targetElement.text}"`);
-                
-                // Кликаем через evaluate для надежности
-                await page.evaluate(() => {
-                    const elements = Array.from(document.querySelectorAll('button, a'));
-                    for (const el of elements) {
-                        const text = el.textContent?.trim().toLowerCase() || '';
-                        if (text.includes('телефон') || text.includes('отправить код')) {
-                            (el as HTMLElement).click();
-                            break;
-                        }
-                    }
-                });
-                
-                smsButtonClicked = true;
-            }
-        } catch (e) {
-            console.log('⚠️ Способ 8 не сработал:', e);
-        }
-    }
-
-    if (!smsButtonClicked) {
-        console.error('❌ Не удалось нажать кнопку/ссылку отправки SMS!');
-        await takeDebugScreenshot(page, login, '09_5_sms_button_not_found');
+    // ТОЧНЫЙ СПОСОБ: Ссылка с классом "bzr-btn" и текстом "Отправить код на телефон"
+    try {
+        // Из логов видно:
+        // "text": "Отправить код на телефон",
+        // "href": "/sign/s2/33VaDHtEw5WrlT48-3OUmQ/sms?return=%2Fpersonal%2F",
+        // "class": "bzr-btn"
         
-        // Сохраняем HTML для анализа
-        try {
-            const htmlContent = await page.content();
-            const timestamp = Date.now();
-            const sanitizedLogin = login.replace(/[^a-zA-Z0-9]/g, '_');
-            const htmlFilename = `${sanitizedLogin}_2fa_page_${timestamp}.html`;
-            const htmlPath = path.join(DEBUG_DIR, htmlFilename);
+        console.log('🎯 Способ 1: Ищем ссылку <a class="bzr-btn"> с текстом "Отправить код на телефон"');
+        
+        const smsLink = await page.$('a.bzr-btn:not(.bzr-btn_style_info)');
+        
+        if (smsLink) {
+            const linkText = await page.evaluate(el => el.textContent?.trim(), smsLink);
+            const linkHref = await page.evaluate(el => el.getAttribute('href'), smsLink);
             
-            fs.writeFileSync(htmlPath, htmlContent, 'utf8');
-            console.log(`📄 HTML сохранен: ${htmlFilename}`);
-        } catch (e) {
-            console.error('⚠️ Ошибка сохранения HTML:', e);
+            console.log(`✅ Найдена ссылка: "${linkText}", href: "${linkHref}"`);
+            
+            // Важно: Используем navigation promise для отслеживания перехода
+            await Promise.all([
+                smsLink.click(),
+                page.waitForNavigation({ 
+                    waitUntil: 'domcontentloaded', 
+                    timeout: 10000 
+                }).catch(() => {
+                    console.log('⚠️ Навигация не произошла, возможно AJAX');
+                })
+            ]);
+            
+            smsButtonClicked = true;
+            console.log('📤 SMS запрошена (способ 1)');
+        } else {
+            console.log('⚠️ Способ 1: Ссылка не найдена');
         }
+    } catch (e: any) {
+        console.log('⚠️ Способ 1 ошибка:', e.message);
+    }
+
+    // СПОСОБ 2: XPath для точной ссылки
+    if (!smsButtonClicked) {
+        try {
+            console.log('🎯 Способ 2: XPath с точным текстом');
+            
+            const [smsLink] = await page.$x("//a[contains(@class, 'bzr-btn') and contains(normalize-space(.), 'Отправить код на телефон')]");
+            
+            if (smsLink) {
+                console.log('✅ Найдена ссылка через XPath');
+                
+                await Promise.all([
+                    smsLink.click(),
+                    page.waitForNavigation({ 
+                        waitUntil: 'domcontentloaded', 
+                        timeout: 10000 
+                    }).catch(() => console.log('⚠️ Навигация не произошла'))
+                ]);
+                
+                smsButtonClicked = true;
+                console.log('📤 SMS запрошена (способ 2)');
+            }
+        } catch (e: any) {
+            console.log('⚠️ Способ 2 ошибка:', e.message);
+        }
+    }
+
+    // СПОСОБ 3: Прямой переход по href
+    if (!smsButtonClicked) {
+        try {
+            console.log('🎯 Способ 3: Извлекаем href и переходим напрямую');
+            
+            const smsHref = await page.evaluate(() => {
+                const link = document.querySelector('a.bzr-btn:not(.bzr-btn_style_info)');
+                return link?.getAttribute('href');
+            });
+            
+            if (smsHref) {
+                console.log(`✅ Найден href: ${smsHref}`);
+                
+                // Если href относительный, делаем его абсолютным
+                const absoluteUrl = smsHref.startsWith('http') 
+                    ? smsHref 
+                    : new URL(smsHref, 'https://my.drom.ru').href;
+                
+                console.log(`🔗 Переходим на: ${absoluteUrl}`);
+                
+                await page.goto(absoluteUrl, { 
+                    waitUntil: 'domcontentloaded',
+                    timeout: 10000 
+                });
+                
+                smsButtonClicked = true;
+                console.log('📤 SMS запрошена (способ 3 - прямой переход)');
+            }
+        } catch (e: any) {
+            console.log('⚠️ Способ 3 ошибка:', e.message);
+        }
+    }
+
+    // СПОСОБ 4: Клик в контексте страницы
+    if (!smsButtonClicked) {
+        try {
+            console.log('🎯 Способ 4: Клик через evaluate (в контексте страницы)');
+            
+            const clicked = await page.evaluate(() => {
+                const links = Array.from(document.querySelectorAll('a'));
+                
+                for (const link of links) {
+                    const text = link.textContent?.trim().toLowerCase() || '';
+                    if (text.includes('отправить код на телефон')) {
+                        link.click();
+                        return true;
+                    }
+                }
+                return false;
+            });
+            
+            if (clicked) {
+                console.log('✅ Клик выполнен через evaluate');
+                
+                // Ждём навигации или изменения DOM
+                await Promise.race([
+                    page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 5000 }).catch(() => null),
+                    page.waitForFunction(
+                        () => document.querySelector('input[name="code"]'),
+                        { timeout: 5000 }
+                    ).catch(() => null),
+                    new Promise(r => setTimeout(r, 5000))
+                ]);
+                
+                smsButtonClicked = true;
+                console.log('📤 SMS запрошена (способ 4)');
+            }
+        } catch (e: any) {
+            console.log('⚠️ Способ 4 ошибка:', e.message);
+        }
+    }
+
+    if (!smsButtonClicked) {
+        console.error('❌ Не удалось нажать кнопку отправки SMS!');
+        await takeDebugScreenshot(page, login, '09_5_sms_button_not_found');
     } else {
         console.log('✅ Кнопка/ссылка SMS успешно нажата!');
     }
 
-    await new Promise(r => setTimeout(r, 2000));
+    // Ждём появления поля для кода или изменения страницы
+    await new Promise(r => setTimeout(r, 3000));
     await takeDebugScreenshot(page, login, '10_sms_requested');
+    
+    // Проверяем результат
+    const currentUrlAfter = page.url();
+    const codeInputAfter = await page.$('input[name="code"]');
+    
+    console.log(`📍 URL после клика: ${currentUrlAfter}`);
+    console.log(`📝 Поле кода ${codeInputAfter ? 'появилось ✅' : 'не появилось ❌'}`);
 
     activeFlows.set(login, {
         browser, 
@@ -967,6 +883,7 @@ if (codeInput || currentUrl.includes('/sign')) {
         message: 'Требуется код подтверждения. Отправьте его в следующем запросе.'
     };
 }
+
 
 
     await takeDebugScreenshot(page, login, '11_login_success');
