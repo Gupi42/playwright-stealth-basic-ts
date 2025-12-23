@@ -751,7 +751,7 @@ if (codeInput || currentUrl.includes('/sign')) {
     // Способ 1: Button с "Отправить код на телефон"
     if (!smsButtonClicked) {
         try {
-            const [sendBtn] = await page.$x("//button[contains(normalize-space(.), 'Отправить код на телефон')]");
+            const [sendBtn] = await page.$$("//button[contains(normalize-space(.), 'Отправить код на телефон')]");
             if (sendBtn) {
                 console.log('✅ Способ 1: Button "Отправить код на телефон"');
                 await sendBtn.click();
@@ -765,7 +765,7 @@ if (codeInput || currentUrl.includes('/sign')) {
     // Способ 2: Button с "телефон"
     if (!smsButtonClicked) {
         try {
-            const [sendBtn] = await page.$x("//button[contains(normalize-space(.), 'телефон')]");
+            const [sendBtn] = await page.$$("//button[contains(normalize-space(.), 'телефон')]");
             if (sendBtn) {
                 console.log('✅ Способ 2: Button с "телефон"');
                 await sendBtn.click();
@@ -781,7 +781,7 @@ if (codeInput || currentUrl.includes('/sign')) {
     // Способ 3: Ссылка <a> с "Отправить код на телефон"
     if (!smsButtonClicked) {
         try {
-            const [sendLink] = await page.$x("//a[contains(normalize-space(.), 'Отправить код на телефон')]");
+            const [sendLink] = await page.$$("//a[contains(normalize-space(.), 'Отправить код на телефон')]");
             if (sendLink) {
                 console.log('✅ Способ 3: Link "Отправить код на телефон"');
                 await sendLink.click();
@@ -795,7 +795,7 @@ if (codeInput || currentUrl.includes('/sign')) {
     // Способ 4: Ссылка <a> с "телефон"
     if (!smsButtonClicked) {
         try {
-            const [sendLink] = await page.$x("//a[contains(normalize-space(.), 'телефон')]");
+            const [sendLink] = await page.$$("//a[contains(normalize-space(.), 'телефон')]");
             if (sendLink) {
                 console.log('✅ Способ 4: Link с "телефон"');
                 await sendLink.click();
@@ -809,7 +809,7 @@ if (codeInput || currentUrl.includes('/sign')) {
     // Способ 5: Ссылка <a> с "Отправить"
     if (!smsButtonClicked) {
         try {
-            const [sendLink] = await page.$x("//a[contains(normalize-space(.), 'Отправить')]");
+            const [sendLink] = await page.$$("//a[contains(normalize-space(.), 'Отправить')]");
             if (sendLink) {
                 console.log('✅ Способ 5: Link с "Отправить"');
                 await sendLink.click();
