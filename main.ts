@@ -24,6 +24,7 @@ function parseProxy(proxyUrl: string) {
         return null;
     }
 }
+
 // === 🛡️ ЗАЩИТА (MIDDLEWARE) ===
 app.use((req, res, next) => {
     if (req.path === '/health') return next();
@@ -245,6 +246,98 @@ async function loadPageWithRetry(page: any, url: string, options: any = {}, maxR
     }
 }
 
+// ===== ANTICAPTCHA INTEGRATION =====
+
+const anticaptcha = require("@antiadmin/anticaptchaofficial");
+
+// Настройка AntiCaptcha (вызовите один раз при старте)
+if (process.env.ANTICAPTCHA_API_KEY) {
+    anticaptcha.setAPIKey(process.env.ANTICAPTCHA_API_KEY);
+    console.log('✅ AntiCaptcha API key configured');
+} else {
+    console.warn('⚠️ ANTICAPTCHA_API_KEY not set in environment variables');
+}
+
+async function solveRecaptchaV2(pageUrl: string, sitekey: string): Promise<string> {
+    console.log('🤖 Отправляем reCAPTCHA v2 на решение через AntiCaptcha...');
+    console.log(`📍 URL: ${pageUrl}`);
+    console.log(`🔑 Sitekey: ${sitekey}`);
+
+    try {
+        const gresponse = await anticaptcha.solveRecaptchaV2Proxyless(pageUrl, sitekey);
+
+        console.log('✅ reCAPTCHA решена!');
+        console.log(`🎫 g-response: ${gresponse.substring(0, 50)}...`);
+
+        // Получаем cookies от AntiCaptcha (если есть)
+        const cookies = anticaptcha.getCookies();
+        if (cookies && cookies.length > 0) {
+            console.log('🍪 Получены cookies от AntiCaptcha');
+        }
+
+        return gresponse;
+
+    } catch (error: any) {
+        console.error('❌ Ошибка решения reCAPTCHA:', error);
+        throw new Error(`AntiCaptcha failed: ${error}`);
+    }
+}
+
+async function setupAntiDetection(page: any) {
+    await page.evaluateOnNewDocument(() => {
+        // 1. Удаляем webdriver
+        Object.defineProperty(navigator, 'webdriver', {
+            get: () => false,
+        });
+
+        // 2. Переопределяем permissions
+        const originalQuery = window.navigator.permissions.query;
+        window.navigator.permissions.query = (parameters: any) => (
+            parameters.name === 'notifications' ?
+                Promise.resolve({ state: Notification.permission } as PermissionStatus) :
+                originalQuery(parameters)
+        );
+
+        // 3. Chrome object
+        (window as any).chrome = {
+            runtime: {},
+            loadTimes: function() {},
+            csi: function() {},
+            app: {}
+        };
+
+        // 4. Plugins
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => [
+                {
+                    0: { type: "application/x-google-chrome-pdf" },
+                    description: "Portable Document Format",
+                    filename: "internal-pdf-viewer",
+                    length: 1,
+                    name: "Chrome PDF Plugin"
+                }
+            ],
+        });
+
+        // 5. Languages
+        Object.defineProperty(navigator, 'languages', {
+            get: () => ['ru-RU', 'ru', 'en-US', 'en'],
+        });
+
+        // 6. Скрываем automation tokens
+        delete (window as any).cdc_adoQpoasnfa76pfcZLmcfl_Array;
+        delete (window as any).cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+        delete (window as any).cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+
+        // 7. Vendor
+        Object.defineProperty(navigator, 'vendor', {
+            get: () => 'Google Inc.',
+        });
+    });
+}
+
+// ===== MAIN LOGIN FLOW WITH ANTICAPTCHA =====
+
 async function startLoginFlow(login: string, password: string, proxyUrl?: string) {
     await cleanupFlow(login);
 
@@ -263,7 +356,10 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
     const browser = await getBrowserInstance(proxyServerArg);
     const page = await browser.newPage();
 
-    // ВАЖНО: Авторизация на прокси
+    // Применяем anti-detection
+    await setupAntiDetection(page);
+
+    // Авторизация на прокси
     if (proxyConfig && proxyConfig.username && proxyConfig.password) {
         console.log('🔑 Авторизация на прокси...');
         await page.authenticate({
@@ -275,8 +371,7 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
     await page.setViewport({ width: 1366, height: 768 });
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36');
 
-    // ❌ ВРЕМЕННО ОТКЛЮЧИТЕ БЛОКИРОВКУ ДЛЯ ТЕСТА!
-    // Без стилей форма может не рендериться
+    // ВРЕМЕННО ОТКЛЮЧЕНА блокировка ресурсов для стабильности
     /*
     await page.setRequestInterception(true);
     page.on('request', (req: any) => {
@@ -289,7 +384,6 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
     });
     */
 
-    // 📸 SCREENSHOT 1
     await takeDebugScreenshot(page, login, '01_initialized');
 
     // 1. Попытка восстановить сессию
@@ -339,7 +433,6 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
     try {
         await loadPageWithRetry(page, 'https://my.drom.ru/sign');
 
-        // Проверяем размер контента
         const content = await page.content();
         console.log(`📄 Размер загруженной страницы: ${content.length} байт`);
 
@@ -351,6 +444,86 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
 
         await takeDebugScreenshot(page, login, '03_login_page_loaded');
 
+        // ========== ПРОВЕРКА И РЕШЕНИЕ RECAPTCHA ==========
+        const recaptchaFrame = await page.$('iframe[src*="recaptcha/api2"]');
+
+        if (recaptchaFrame) {
+            console.log('🔒 Обнаружена reCAPTCHA v2!');
+            await takeDebugScreenshot(page, login, '03_5_recaptcha_detected');
+
+            // Извлекаем sitekey из iframe
+            const sitekey = await page.evaluate(() => {
+                const iframe = document.querySelector('iframe[src*="recaptcha/api2"]') as HTMLIFrameElement;
+                if (!iframe) return null;
+
+                const src = iframe.getAttribute('src') || '';
+                const match = src.match(/[?&]k=([^&]+)/);
+                return match ? match[1] : null;
+            });
+
+            if (!sitekey) {
+                console.error('❌ Не удалось найти sitekey для reCAPTCHA');
+                await takeDebugScreenshot(page, login, '03_5_no_sitekey');
+                throw new Error('reCAPTCHA sitekey not found');
+            }
+
+            console.log(`🔑 Найден sitekey: ${sitekey}`);
+
+            // Проверяем наличие API ключа
+            if (!process.env.ANTICAPTCHA_API_KEY) {
+                console.error('❌ ANTICAPTCHA_API_KEY не настроен в переменных окружения!');
+                await takeDebugScreenshot(page, login, '03_5_no_api_key');
+                throw new Error('AntiCaptcha API key not configured. Please set ANTICAPTCHA_API_KEY environment variable.');
+            }
+
+            try {
+                // Решаем капчу
+                const gresponse = await solveRecaptchaV2(page.url(), sitekey);
+
+                // Вставляем решение в страницу
+                await page.evaluate((token: string) => {
+                    // Находим textarea для g-recaptcha-response
+                    const textarea = document.querySelector('textarea[name="g-recaptcha-response"]') as HTMLTextAreaElement;
+                    if (textarea) {
+                        textarea.innerHTML = token;
+                        textarea.value = token;
+                        textarea.style.display = 'block';
+                    }
+
+                    // Также вставляем в hidden input если есть
+                    const input = document.querySelector('input[name="g-recaptcha-response"]') as HTMLInputElement;
+                    if (input) {
+                        input.value = token;
+                    }
+
+                    // Вызываем callback если он определен
+                    if (typeof (window as any).grecaptcha !== 'undefined') {
+                        const clients = (window as any).___grecaptcha_cfg?.clients;
+                        if (clients) {
+                            Object.keys(clients).forEach((key) => {
+                                const client = clients[key];
+                                if (client && client.callback) {
+                                    client.callback(token);
+                                }
+                            });
+                        }
+                    }
+                }, gresponse);
+
+                console.log('✅ Решение reCAPTCHA вставлено в страницу');
+                await new Promise(r => setTimeout(r, 1500));
+                await takeDebugScreenshot(page, login, '03_6_recaptcha_solved');
+
+            } catch (captchaError: any) {
+                console.error('❌ Ошибка при решении reCAPTCHA:', captchaError.message);
+                await takeDebugScreenshot(page, login, '03_5_captcha_error');
+                await browser.close();
+                throw new Error(`Failed to solve reCAPTCHA: ${captchaError.message}`);
+            }
+        } else {
+            console.log('✅ reCAPTCHA не обнаружена, продолжаем без решения');
+        }
+
     } catch (e) {
         console.error('❌ Ошибка загрузки страницы логина:', e);
         await takeDebugScreenshot(page, login, '03_login_page_load_error');
@@ -358,238 +531,165 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
         throw e;
     }
 
-const loginInputSelector = 'input[name="sign"]';
-try {
-    // Ждем появления поля логина
-    await page.waitForSelector(loginInputSelector, { visible: true, timeout: 30000 });
-    console.log('✅ Поле логина найдено');
-    await takeDebugScreenshot(page, login, '04_login_field_found');
-
-    // Вводим логин
-    console.log('⌨️ Ввод логина...');
-    await page.click(loginInputSelector); // Фокус на поле
-    await new Promise(r => setTimeout(r, 500));
-    await page.type(loginInputSelector, login, { delay: 100 + Math.random() * 50 });
-    await new Promise(r => setTimeout(r, 500));
-    await takeDebugScreenshot(page, login, '05_login_entered');
-
-    // Вводим пароль
-    console.log('⌨️ Ввод пароля...');
-    const passwordSelector = 'input[type="password"]';
-    await page.click(passwordSelector); // Фокус на поле
-    await new Promise(r => setTimeout(r, 500));
-    await page.type(passwordSelector, password, { delay: 100 + Math.random() * 50 });
-    await new Promise(r => setTimeout(r, 800));
-    await takeDebugScreenshot(page, login, '06_password_entered');
-
-    // Нажимаем кнопку входа (УЛУЧШЕННЫЙ СПОСОБ)
-    console.log('🔘 Поиск кнопки входа...');
-    
-    // Проверяем существование кнопки
-    const buttonExists = await page.$('#signbutton');
-    if (buttonExists) {
-        console.log('✅ Найдена кнопка #signbutton');
-        
-        // Скроллим к кнопке (если нужно)
-        await page.evaluate(() => {
-            const btn = document.querySelector('#signbutton');
-            if (btn) btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        });
-        
-        await new Promise(r => setTimeout(r, 500));
-        
-        // Кликаем
-        await page.click('#signbutton');
-        console.log('✅ Клик по кнопке входа выполнен');
-        
-    } else {
-        console.log('⚠️ Кнопка #signbutton не найдена, пробуем fallback');
-        await page.click('button[type="submit"]');
-        console.log('✅ Клик по button[type="submit"] выполнен');
-    }
-
-    // Ждем реакции страницы (навигация, появление кода или просто задержка)
-    console.log('⏳ Ожидание реакции после клика...');
-    await Promise.race([
-        page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 10000 })
-            .then(() => console.log('✅ Произошла навигация'))
-            .catch(() => console.log('⚠️ Навигация не обнаружена')),
-        page.waitForSelector('input[name="code"]', { timeout: 10000 })
-            .then(() => console.log('✅ Появилось поле для кода'))
-            .catch(() => console.log('⚠️ Поле кода не появилось')),
-        new Promise(r => setTimeout(r, 5000))
-    ]);
-
-    await takeDebugScreenshot(page, login, '07_after_login_click');
-
-} catch (e: any) {
-    console.error('❌ Ошибка при вводе логина/пароля:', e.message);
-    await takeDebugScreenshot(page, login, '08_login_input_error');
-    await browser.close();
-    throw e;
-}
-
-
-    // 3. Проверка 2FA
-// 3. Проверка 2FA
-const currentUrl = page.url();
-console.log(`📍 Текущий URL: ${currentUrl}`);
-await takeDebugScreenshot(page, login, '08_checking_2fa');
-
-// Проверяем наличие поля ввода кода
-const codeInput = await page.$('input[name="code"]');
-
-if (codeInput || currentUrl.includes('/sign')) { 
-    console.log('📱 Drom запрашивает код подтверждения');
-    await takeDebugScreenshot(page, login, '09_verification_required');
-
-    // 🆕 ДЕБАГ: Сохраняем HTML страницы в файл
+    // 3. Ввод логина и пароля
+    const loginInputSelector = 'input[name="sign"]';
     try {
-        const htmlContent = await page.content();
-        const timestamp = Date.now();
-        const sanitizedLogin = login.replace(/[^a-zA-Z0-9]/g, '_');
-        const htmlFilename = `${sanitizedLogin}_verification_page_${timestamp}.html`;
-        const htmlPath = path.join(DEBUG_DIR, htmlFilename);
-        
-        fs.writeFileSync(htmlPath, htmlContent, 'utf8');
-        console.log(`📄 HTML страницы сохранен: ${htmlFilename}`);
-        console.log(`📏 Размер HTML: ${htmlContent.length} байт`);
-    } catch (e) {
-        console.error('⚠️ Ошибка сохранения HTML:', e);
-    }
+        await page.waitForSelector(loginInputSelector, { visible: true, timeout: 30000 });
+        console.log('✅ Поле логина найдено');
+        await takeDebugScreenshot(page, login, '04_login_field_found');
 
-    // 🆕 ДЕБАГ: Выводим информацию о найденных кнопках
-    const buttonsInfo = await page.evaluate(() => {
-        const buttons = Array.from(document.querySelectorAll('button'));
-        return buttons.map((btn, idx) => ({
-            index: idx,
-            text: btn.textContent?.trim(),
-            type: btn.getAttribute('type'),
-            class: btn.getAttribute('class'),
-            id: btn.getAttribute('id'),
-            visible: btn.offsetWidth > 0 && btn.offsetHeight > 0
-        }));
-    });
-    console.log('🔍 Найденные кнопки на странице:', JSON.stringify(buttonsInfo, null, 2));
+        // Вводим логин
+        console.log('⌨️ Ввод логина...');
+        await page.click(loginInputSelector);
+        await humanDelay(500, 1000);
+        await page.type(loginInputSelector, login, { delay: 100 + Math.random() * 50 });
+        await humanDelay(500, 1000);
+        await takeDebugScreenshot(page, login, '05_login_entered');
 
-    // 🆕 УЛУЧШЕННЫЙ поиск кнопки отправки SMS
-    console.log('📤 Ищем кнопку отправки кода...');
-    
-    let smsButtonClicked = false;
+        // Вводим пароль
+        console.log('⌨️ Ввод пароля...');
+        const passwordSelector = 'input[type="password"]';
+        await page.click(passwordSelector);
+        await humanDelay(500, 1000);
+        await page.type(passwordSelector, password, { delay: 100 + Math.random() * 50 });
+        await humanDelay(800, 1500);
+        await takeDebugScreenshot(page, login, '06_password_entered');
 
-    // Способ 1: Текст содержит "Отправить код"
-    try {
-        const [sendBtn1] = await page.$$("//button[contains(text(), 'Отправить код')]");
-        if (sendBtn1) {
-            console.log('✅ Найдена кнопка через XPath (contains "Отправить код")');
-            await sendBtn1.click();
-            smsButtonClicked = true;
-            console.log('📤 SMS запрошена (способ 1)');
+        // Нажимаем кнопку входа
+        console.log('🔘 Поиск кнопки входа...');
+
+        const buttonExists = await page.$('#signbutton');
+        if (buttonExists) {
+            console.log('✅ Найдена кнопка #signbutton');
+
+            // Скроллим к кнопке
+            await page.evaluate(() => {
+                const btn = document.querySelector('#signbutton');
+                if (btn) btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            });
+
+            await humanDelay(500, 1000);
+            await page.click('#signbutton');
+            console.log('✅ Клик по кнопке входа выполнен');
+
+        } else {
+            console.log('⚠️ Кнопка #signbutton не найдена, пробуем fallback');
+            await page.click('button[type="submit"]');
+            console.log('✅ Клик по button[type="submit"] выполнен');
         }
-    } catch (e) {
-        console.log('⚠️ Способ 1 не сработал');
+
+        // Ждем реакции страницы
+        console.log('⏳ Ожидание реакции после клика...');
+        await Promise.race([
+            page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 10000 })
+                .then(() => console.log('✅ Произошла навигация'))
+                .catch(() => console.log('⚠️ Навигация не обнаружена')),
+            page.waitForSelector('input[name="code"]', { timeout: 10000 })
+                .then(() => console.log('✅ Появилось поле для кода'))
+                .catch(() => console.log('⚠️ Поле кода не появилось')),
+            new Promise(r => setTimeout(r, 5000))
+        ]);
+
+        await takeDebugScreenshot(page, login, '07_after_login_click');
+
+    } catch (e: any) {
+        console.error('❌ Ошибка при вводе логина/пароля:', e.message);
+        await takeDebugScreenshot(page, login, '08_login_input_error');
+        await browser.close();
+        throw e;
     }
 
-    // Способ 2: Если не нашли, ищем по частичному тексту "телефон"
-    if (!smsButtonClicked) {
+    // 4. Проверка 2FA
+    const currentUrl = page.url();
+    console.log(`📍 Текущий URL: ${currentUrl}`);
+    await takeDebugScreenshot(page, login, '08_checking_2fa');
+
+    const codeInput = await page.$('input[name="code"]');
+
+    if (codeInput || currentUrl.includes('/sign')) { 
+        console.log('📱 Drom запрашивает код подтверждения');
+        await takeDebugScreenshot(page, login, '09_verification_required');
+
+        // Поиск кнопки отправки SMS (улучшенный)
+        console.log('📤 Ищем кнопку отправки кода...');
+
+        let smsButtonClicked = false;
+
+        // Способ 1: XPath с "Отправить код"
         try {
-            const [sendBtn2] = await page.$$("//button[contains(text(), 'телефон')]");
-            if (sendBtn2) {
-                console.log('✅ Найдена кнопка через XPath (contains "телефон")');
-                await sendBtn2.click();
+            const [sendBtn1] = await page.$x("//button[contains(text(), 'Отправить код')]");
+            if (sendBtn1) {
+                console.log('✅ Найдена кнопка через XPath (contains "Отправить код")');
+                await sendBtn1.click();
                 smsButtonClicked = true;
-                console.log('📤 SMS запрошена (способ 2)');
+                console.log('📤 SMS запрошена (способ 1)');
             }
         } catch (e) {
-            console.log('⚠️ Способ 2 не сработал');
+            console.log('⚠️ Способ 1 не сработал');
         }
-    }
 
-    // Способ 3: Ищем серую кнопку (по классу)
-    if (!smsButtonClicked) {
-        try {
-            // На вашем скриншоте это серая кнопка, возможно с классом типа btn_gray
-            const grayButton = await page.$('button.bzr-btn_style_default');
-            if (grayButton) {
-                const buttonText = await page.evaluate(el => el.textContent, grayButton);
-                console.log(`✅ Найдена серая кнопка с текстом: "${buttonText?.trim()}"`);
-                
-                if (buttonText?.includes('телефон') || buttonText?.includes('код')) {
-                    await grayButton.click();
+        // Способ 2: XPath с "телефон"
+        if (!smsButtonClicked) {
+            try {
+                const [sendBtn2] = await page.$x("//button[contains(text(), 'телефон')]");
+                if (sendBtn2) {
+                    console.log('✅ Найдена кнопка через XPath (contains "телефон")');
+                    await sendBtn2.click();
                     smsButtonClicked = true;
-                    console.log('📤 SMS запрошена (способ 3)');
+                    console.log('📤 SMS запрошена (способ 2)');
                 }
+            } catch (e) {
+                console.log('⚠️ Способ 2 не сработал');
             }
-        } catch (e) {
-            console.log('⚠️ Способ 3 не сработал');
         }
-    }
 
-    // Способ 4: Кликаем по второй кнопке (если первая - Telegram)
-    if (!smsButtonClicked) {
-        try {
-            const allButtons = await page.$$('button');
-            console.log(`🔍 Всего кнопок на странице: ${allButtons.length}`);
-            
-            if (allButtons.length >= 2) {
-                // Обычно первая кнопка - Telegram, вторая - SMS
-                const secondButton = allButtons[1];
-                const buttonText = await page.evaluate(el => el.textContent, secondButton);
-                console.log(`🔘 Пробуем кликнуть вторую кнопку: "${buttonText?.trim()}"`);
-                
-                await secondButton.click();
-                smsButtonClicked = true;
-                console.log('📤 SMS запрошена (способ 4)');
+        // Способ 3: Серая кнопка по классу
+        if (!smsButtonClicked) {
+            try {
+                const grayButton = await page.$('button.bzr-btn_style_default');
+                if (grayButton) {
+                    const buttonText = await page.evaluate(el => el.textContent, grayButton);
+                    console.log(`✅ Найдена серая кнопка: "${buttonText?.trim()}"`);
+
+                    if (buttonText?.includes('телефон') || buttonText?.includes('код')) {
+                        await grayButton.click();
+                        smsButtonClicked = true;
+                        console.log('📤 SMS запрошена (способ 3)');
+                    }
+                }
+            } catch (e) {
+                console.log('⚠️ Способ 3 не сработал');
             }
-        } catch (e) {
-            console.log('⚠️ Способ 4 не сработал');
         }
-    }
 
-    // Способ 5: Человеческий клик по координатам (если известны из скриншота)
-    if (!smsButtonClicked) {
-        try {
-            console.log('⚠️ Все способы не сработали, пробуем клик по координатам...');
-            // Координаты серой кнопки на вашем скриншоте (примерно)
-            await page.mouse.click(682, 404); // Центр серой кнопки
-            smsButtonClicked = true;
-            console.log('📤 SMS запрошена (способ 5 - координаты)');
-        } catch (e) {
-            console.log('⚠️ Способ 5 не сработал');
+        if (!smsButtonClicked) {
+            console.error('❌ Не удалось нажать кнопку отправки SMS!');
+            await takeDebugScreenshot(page, login, '09_5_sms_button_not_found');
         }
+
+        await new Promise(r => setTimeout(r, 2000));
+        await takeDebugScreenshot(page, login, '10_sms_requested');
+
+        activeFlows.set(login, {
+            browser, 
+            page,
+            timestamp: Date.now(),
+            timer: setTimeout(() => cleanupFlow(login), 300 * 1000)
+        });
+
+        return {
+            success: false,
+            needsVerification: true,
+            message: 'Требуется код подтверждения. Отправьте его в следующем запросе.'
+        };
     }
 
-    if (!smsButtonClicked) {
-        console.error('❌ Не удалось нажать кнопку отправки SMS ни одним способом!');
-        await takeDebugScreenshot(page, login, '09_5_sms_button_not_found');
-    }
+    await takeDebugScreenshot(page, login, '11_login_success');
+    console.log('✅ Вход выполнен успешно');
 
-    // Ждем после клика
-    await new Promise(r => setTimeout(r, 2000));
-    await takeDebugScreenshot(page, login, '10_sms_requested');
-
-    // Сохраняем flow для последующего ввода кода
-    activeFlows.set(login, {
-        browser, 
-        page,
-        timestamp: Date.now(),
-        timer: setTimeout(() => cleanupFlow(login), 300 * 1000)
-    });
-
-    return {
-        success: false,
-        needsVerification: true,
-        message: 'Требуется код подтверждения. Отправьте его в следующем запросе.'
-    };
+    return { success: true, browser, page };
 }
 
-// Если код не требуется - успешный вход
-await takeDebugScreenshot(page, login, '11_login_success');
-console.log('✅ Вход выполнен успешно');
-
-return { success: true, browser, page };
-
-}
 
 async function humanClick(page: any, selector: string) {
     try {
