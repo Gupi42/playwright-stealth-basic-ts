@@ -191,29 +191,50 @@ async function completeLoginFlow(login: string, code: string) {
         throw new Error('Неверный код или ошибка сайта');
     }
 }
+// ===== ВЫНЕСИТЕ ЭТУ ФУНКЦИЮ ЗА ПРЕДЕЛЫ startLoginFlow =====
+// Разместите её ПЕРЕД функцией startLoginFlow на уровне модуля
+async function takeDebugScreenshot(page: any, login: string, step: string) {
+    try {
+        const timestamp = Date.now();
+        const sanitizedLogin = login.replace(/[^a-zA-Z0-9]/g, '_');
+        const filename = `${sanitizedLogin}_${step}_${timestamp}.png`;
+        const filepath = path.join(DEBUG_DIR, filename);
+
+        await page.screenshot({ 
+            path: filepath, 
+            fullPage: true 
+        });
+
+        console.log(`📸 Скриншот сохранен: ${filename}`);
+        return filename;
+    } catch (e) {
+        console.error(`⚠️ Ошибка создания скриншота на этапе ${step}:`, e);
+        return null;
+    }
+}
+
 async function loadPageWithRetry(page: any, url: string, options: any = {}, maxRetries: number = 3) {
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
             console.log(`🔄 Попытка ${attempt}/${maxRetries} загрузить ${url}`);
-            
+
             await page.goto(url, {
                 waitUntil: 'domcontentloaded',
                 timeout: 60000,
                 ...options
             });
-            
+
             console.log(`✅ Страница загружена с попытки ${attempt}`);
             return; // Успех
-            
+
         } catch (error: any) {
             console.error(`❌ Попытка ${attempt} не удалась:`, error.message);
-            
+
             if (attempt === maxRetries) {
                 throw error; // Исчерпаны попытки
             }
-            
-            // Пауза перед повтором (увеличивается с каждой попыткой)
-            const delay = attempt * 3000; // 3, 6, 9 секунд
+
+            const delay = attempt * 3000;
             console.log(`⏳ Ожидание ${delay/1000} секунд перед повтором...`);
             await new Promise(r => setTimeout(r, delay));
         }
@@ -226,38 +247,17 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
     let proxyConfig = null;
     let proxyServerArg = undefined;
 
-    // Парсим прокси
     const proxyToUse = proxyUrl || GLOBAL_PROXY_URL;
     if (proxyToUse) {
         proxyConfig = parseProxy(proxyToUse);
         if (proxyConfig) {
-            proxyServerArg = proxyConfig.server; // Только http://ip:port
+            proxyServerArg = proxyConfig.server;
             console.log(`🌐 Прокси: ${proxyServerArg}`);
         }
     }
 
     const browser = await getBrowserInstance(proxyServerArg);
     const page = await browser.newPage();
-
-    // 📸 HELPER: Функция для создания скриншотов
-    async function takeDebugScreenshot(step: string) {
-        try {
-            const timestamp = Date.now();
-            const sanitizedLogin = login.replace(/[^a-zA-Z0-9]/g, '_');
-            const filename = `${sanitizedLogin}_${step}_${timestamp}.png`;
-            const filepath = path.join(DEBUG_DIR, filename);
-
-            await page.screenshot({ 
-                path: filepath, 
-                fullPage: true 
-            });
-
-            console.log(`📸 Скриншот сохранен: ${filename}`);
-            return filename;
-        } catch (e) {
-            console.error(`⚠️ Ошибка создания скриншота на этапе ${step}:`, e);
-        }
-    }
 
     // ВАЖНО: Авторизация на прокси
     if (proxyConfig && proxyConfig.username && proxyConfig.password) {
@@ -271,7 +271,9 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
     await page.setViewport({ width: 1366, height: 768 });
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36');
 
-    // // Блокировка ресурсов
+    // ❌ ВРЕМЕННО ОТКЛЮЧИТЕ БЛОКИРОВКУ ДЛЯ ТЕСТА!
+    // Без стилей форма может не рендериться
+    /*
     await page.setRequestInterception(true);
     page.on('request', (req: any) => {
         const type = req.resourceType();
@@ -281,9 +283,10 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
             req.continue();
         }
     });
+    */
 
-    // 📸 SCREENSHOT 1: После инициализации
-    await takeDebugScreenshot('01_initialized');
+    // 📸 SCREENSHOT 1
+    await takeDebugScreenshot(page, login, '01_initialized');
 
     // 1. Попытка восстановить сессию
     const sessionPath = getSessionPath(login);
@@ -292,7 +295,6 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
             const state = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
             const stats = fs.statSync(sessionPath);
 
-            // Сессия моложе 30 дней
             if (Date.now() - stats.mtimeMs < 30 * 24 * 60 * 60 * 1000) {
                 if (state.cookies && Array.isArray(state.cookies)) {
                     await page.setCookie(...state.cookies);
@@ -308,23 +310,17 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
                 console.log(`🔄 Пробуем восстановить сессию для ${login}...`);
 
                 try {
-                   await page.goto('https://my.drom.ru/personal/', { 
-                       waitUntil: 'domcontentloaded', 
-                       timeout: 60000 
-                   });
+                   await loadPageWithRetry(page, 'https://my.drom.ru/personal/');
+                   await takeDebugScreenshot(page, login, '02_session_restore_attempt');
 
-                   // 📸 SCREENSHOT 2: После попытки восстановления сессии
-                   await takeDebugScreenshot('02_session_restore_attempt');
-
-                   // Проверка, не выкинуло ли на логин
                    if (!page.url().includes('sign')) {
                         console.log('✅ Сессия восстановлена');
-                        await takeDebugScreenshot('03_session_restored_success');
+                        await takeDebugScreenshot(page, login, '03_session_restored_success');
                         return { success: true, browser, page };
                    }
                 } catch(e) {
                    console.log('⚠️ Ошибка при переходе с куками:', e);
-                   await takeDebugScreenshot('02_session_restore_error');
+                   await takeDebugScreenshot(page, login, '02_session_restore_error');
                 }
             }
             console.log('⚠️ Сессия устарела или невалидна, нужен ре-логин');
@@ -337,27 +333,23 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
     console.log('🔐 Входим по логину/паролю...');
 
     try {
-        // await page.goto('https://my.drom.ru/sign', { 
-        //     waitUntil: 'domcontentloaded', 
-        //     timeout: 60000 
-        // });
         await loadPageWithRetry(page, 'https://my.drom.ru/sign');
-// Проверяем размер контента
-const content = await page.content();
-if (content.length < 10000) {
-    console.warn(`⚠️ Подозрительно маленькая страница: ${content.length} байт`);
-    await takeDebugScreenshot('03_suspicious_small_page');
-    throw new Error('Прокси вернул неполную страницу');
-}
 
-await takeDebugScreenshot('03_login_page_loaded');
+        // Проверяем размер контента
+        const content = await page.content();
+        console.log(`📄 Размер загруженной страницы: ${content.length} байт`);
 
-        // 📸 SCREENSHOT 3: Страница логина загружена
-        await takeDebugScreenshot('03_login_page_loaded');
+        if (content.length < 10000) {
+            console.warn(`⚠️ Подозрительно маленькая страница: ${content.length} байт`);
+            await takeDebugScreenshot(page, login, '03_suspicious_small_page');
+            throw new Error('Прокси вернул неполную страницу');
+        }
+
+        await takeDebugScreenshot(page, login, '03_login_page_loaded');
 
     } catch (e) {
         console.error('❌ Ошибка загрузки страницы логина:', e);
-        await takeDebugScreenshot('03_login_page_load_error');
+        await takeDebugScreenshot(page, login, '03_login_page_load_error');
         await browser.close();
         throw e;
     }
@@ -365,41 +357,31 @@ await takeDebugScreenshot('03_login_page_loaded');
     const loginInputSelector = 'input[name="sign"]';
     try {
         await page.waitForSelector(loginInputSelector, { visible: true, timeout: 30000 });
-
-        // 📸 SCREENSHOT 4: Поле логина найдено
-        await takeDebugScreenshot('04_login_field_found');
+        await takeDebugScreenshot(page, login, '04_login_field_found');
 
         await page.type(loginInputSelector, login, { delay: 100 });
         await new Promise(r => setTimeout(r, 300));
-
-        // 📸 SCREENSHOT 5: Логин введен
-        await takeDebugScreenshot('05_login_entered');
+        await takeDebugScreenshot(page, login, '05_login_entered');
 
         await page.type('input[type="password"]', password, { delay: 100 });
         await new Promise(r => setTimeout(r, 500));
+        await takeDebugScreenshot(page, login, '06_password_entered');
 
-        // 📸 SCREENSHOT 6: Пароль введен
-        await takeDebugScreenshot('06_password_entered');
-
-        // Ищем кнопку "Войти с паролем"
         const [button] = await page.$$("xpath/.//button[contains(., 'Войти с паролем')]");
         if (button) {
             await button.click();
             console.log('✅ Кнопка "Войти с паролем" нажата');
         } else {
-             // Fallback если текст другой
              await page.click('button[type="submit"]');
              console.log('✅ Кнопка submit нажата (fallback)');
         }
 
         await new Promise(r => setTimeout(r, 3000));
-
-        // 📸 SCREENSHOT 7: После нажатия кнопки входа
-        await takeDebugScreenshot('07_after_login_click');
+        await takeDebugScreenshot(page, login, '07_after_login_click');
 
     } catch (e) {
         console.error("❌ Ошибка при вводе логина:", e);
-        await takeDebugScreenshot('08_login_input_error');
+        await takeDebugScreenshot(page, login, '08_login_input_error');
         await browser.close();
         throw e;
     }
@@ -407,28 +389,20 @@ await takeDebugScreenshot('03_login_page_loaded');
     // 3. Проверка 2FA
     const currentUrl = page.url();
     console.log(`📍 Текущий URL: ${currentUrl}`);
+    await takeDebugScreenshot(page, login, '08_checking_2fa');
 
-    // 📸 SCREENSHOT 8: Проверка на 2FA
-    await takeDebugScreenshot('08_checking_2fa');
-
-    // Проверяем наличие поля ввода кода
     const codeInput = await page.$('input[name="code"]');
 
     if (codeInput || currentUrl.includes('/sign')) { 
         console.log('📱 Drom запрашивает код подтверждения');
+        await takeDebugScreenshot(page, login, '09_verification_required');
 
-        // 📸 SCREENSHOT 9: Требуется верификация
-        await takeDebugScreenshot('09_verification_required');
-
-        // Поиск кнопки отправить код
         const [sendBtn] = await page.$$("xpath/.//div[contains(text(), 'Отправить код')] | //button[contains(text(), 'Отправить код')]");
         if (sendBtn) {
             await sendBtn.click();
             console.log('📤 SMS запрошена');
             await new Promise(r => setTimeout(r, 2000));
-
-            // 📸 SCREENSHOT 10: После запроса SMS
-            await takeDebugScreenshot('10_sms_requested');
+            await takeDebugScreenshot(page, login, '10_sms_requested');
         }
 
         activeFlows.set(login, {
@@ -445,8 +419,7 @@ await takeDebugScreenshot('03_login_page_loaded');
         };
     }
 
-    // 📸 SCREENSHOT 11: Успешный вход
-    await takeDebugScreenshot('11_login_success');
+    await takeDebugScreenshot(page, login, '11_login_success');
     console.log('✅ Вход выполнен успешно');
 
     return { success: true, browser, page };
