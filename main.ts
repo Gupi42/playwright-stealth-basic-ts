@@ -243,16 +243,16 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
     await page.setViewport({ width: 1366, height: 768 });
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36');
 
-    // Блокировка ресурсов
-    await page.setRequestInterception(true);
-    page.on('request', (req: any) => {
-        const type = req.resourceType();
-        if (['image', 'font', 'media', 'stylesheet'].includes(type)) {
-            req.abort();
-        } else {
-            req.continue();
-        }
-    });
+    // // Блокировка ресурсов
+    // await page.setRequestInterception(true);
+    // page.on('request', (req: any) => {
+    //     const type = req.resourceType();
+    //     if (['image', 'font', 'media', 'stylesheet'].includes(type)) {
+    //         req.abort();
+    //     } else {
+    //         req.continue();
+    //     }
+    // });
 
     // 📸 SCREENSHOT 1: После инициализации
     await takeDebugScreenshot('01_initialized');
