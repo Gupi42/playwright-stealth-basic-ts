@@ -81,6 +81,10 @@ async function cleanupFlow(login: string) {
         activeFlows.delete(login);
     }
 }
+async function humanDelay(min: number = 1000, max: number = 3000) {
+    const delay = Math.floor(Math.random() * (max - min + 1)) + min;
+    await new Promise(r => setTimeout(r, delay));
+}
 
 // 🆕 УЛУЧШЕННАЯ ФУНКЦИЯ ЛОГАУТА
 async function performLogout(page: any, login: string): Promise<void> {
@@ -360,7 +364,7 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
         await takeDebugScreenshot(page, login, '04_login_field_found');
 
         await page.type(loginInputSelector, login, { delay: 100 });
-        await new Promise(r => setTimeout(r, 300));
+        await humanDelay(500, 1500);
         await takeDebugScreenshot(page, login, '05_login_entered');
 
         await page.type('input[type="password"]', password, { delay: 100 });
@@ -455,7 +459,10 @@ async function getBrowserInstance(proxyServer?: string) {
             '--no-sandbox',
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
-            '--window-size=1366,768'
+            '--window-size=1366,768',
+            '--disable-blink-features=AutomationControlled',  // 🆕 КРИТИЧЕСКИ ВАЖНО!
+            '--disable-features=IsolateOrigins,site-per-process',
+            '--disable-web-security',
         ],
         ignoreHTTPSErrors: true,
         executablePath: process.env.PUPPETEER_EXECUTABLE_PATH
@@ -466,6 +473,36 @@ async function getBrowserInstance(proxyServer?: string) {
     }
 
     return await puppeteer.launch(launchOptions);
+}
+async function setupAntiDetection(page: any) {
+    await page.evaluateOnNewDocument(() => {
+        // Удаляем webdriver property
+        Object.defineProperty(navigator, 'webdriver', {
+            get: () => false,
+        });
+
+        // Переопределяем permissions
+        const originalQuery = window.navigator.permissions.query;
+        window.navigator.permissions.query = (parameters: any) => (
+            parameters.name === 'notifications' ?
+                Promise.resolve({ state: Notification.permission } as PermissionStatus) :
+                originalQuery(parameters)
+        );
+
+        // Добавляем chrome object
+        (window as any).chrome = {
+            runtime: {},
+        };
+
+        // Маскируем plugins и languages
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => [1, 2, 3, 4, 5],
+        });
+
+        Object.defineProperty(navigator, 'languages', {
+            get: () => ['ru-RU', 'ru', 'en-US', 'en'],
+        });
+    });
 }
 
 // 🆕 УЛУЧШЕННАЯ ФУНКЦИЯ ОЧИСТКИ КОНТЕКСТА ПЕРЕД ЗАГРУЗКОЙ НОВОЙ СЕССИИ
@@ -572,7 +609,7 @@ app.post('/drom/logout', async (req: Request, res: Response) => {
 
         browser = await puppeteer.launch(launchOptions);
         const page = await browser.newPage();
-
+        await setupAntiDetection(page);
         // Загружаем сессию если есть
         await loadSessionIfExists(login, page);
 
@@ -866,52 +903,6 @@ app.post('/drom/send-offer', async (req: Request, res: Response) => {
 });
 
 app.get('/health', (_, res) => res.send('OK'));
-// Список всех скриншотов
-app.get('/debug/screenshots', async (req: Request, res: Response) => {
-    const apiKey = req.headers['x-api-key'];
-    if (apiKey !== process.env.API_SECRET) {
-        return res.status(403).json({ error: 'Access denied' });
-    }
 
-    try {
-        const files = fs.readdirSync(DEBUG_DIR);
-        const screenshots = files
-            .filter(f => f.endsWith('.png'))
-            .map(f => {
-                const stats = fs.statSync(path.join(DEBUG_DIR, f));
-                return {
-                    filename: f,
-                    size: stats.size,
-                    created: stats.birthtime
-                };
-            })
-            .sort((a, b) => b.created.getTime() - a.created.getTime());
-        
-        res.json({ screenshots });
-    } catch (e: any) {
-        res.status(500).json({ error: e.message });
-    }
-});
-
-// Скачать конкретный скриншот
-app.get('/debug/screenshot/:filename', async (req: Request, res: Response) => {
-    const apiKey = req.headers['x-api-key'];
-    if (apiKey !== process.env.API_SECRET) {
-        return res.status(403).json({ error: 'Access denied' });
-    }
-
-    try {
-        const filename = req.params.filename;
-        const filepath = path.join(DEBUG_DIR, filename);
-        
-        if (!fs.existsSync(filepath)) {
-            return res.status(404).send('File not found');
-        }
-        
-        res.sendFile(filepath);
-    } catch (e: any) {
-        res.status(500).json({ error: e.message });
-    }
-});
 const PORT = Number(process.env.PORT) || 3000;
 app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server on port ${PORT}`));
