@@ -661,7 +661,7 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
         console.log('💬 Загрузка списка диалогов...');
         
         await page.goto('https://my.drom.ru/personal/messaging-modal?switchPosition=dialogs', { waitUntil: 'domcontentloaded', timeout: 60000 });
-
+        await new Promise(r => setTimeout(r, 3000));  // 🆕 Ждем 3 секунды стабилизации
         try {
             await page.waitForSelector('.dialog-list__li', { timeout: 10000 });
         } catch {
