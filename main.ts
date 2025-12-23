@@ -431,42 +431,164 @@ try {
 
 
     // 3. Проверка 2FA
-    const currentUrl = page.url();
-    console.log(`📍 Текущий URL: ${currentUrl}`);
-    await takeDebugScreenshot(page, login, '08_checking_2fa');
+// 3. Проверка 2FA
+const currentUrl = page.url();
+console.log(`📍 Текущий URL: ${currentUrl}`);
+await takeDebugScreenshot(page, login, '08_checking_2fa');
 
-    const codeInput = await page.$('input[name="code"]');
+// Проверяем наличие поля ввода кода
+const codeInput = await page.$('input[name="code"]');
 
-    if (codeInput || currentUrl.includes('/sign')) { 
-        console.log('📱 Drom запрашивает код подтверждения');
-        await takeDebugScreenshot(page, login, '09_verification_required');
+if (codeInput || currentUrl.includes('/sign')) { 
+    console.log('📱 Drom запрашивает код подтверждения');
+    await takeDebugScreenshot(page, login, '09_verification_required');
 
-        const [sendBtn] = await page.$$("xpath/.//div[contains(text(), 'Отправить код')] | //button[contains(text(), 'Отправить код')]");
-        if (sendBtn) {
-            await sendBtn.click();
-            console.log('📤 SMS запрошена');
-            await new Promise(r => setTimeout(r, 2000));
-            await takeDebugScreenshot(page, login, '10_sms_requested');
-        }
-
-        activeFlows.set(login, {
-            browser, 
-            page,
-            timestamp: Date.now(),
-            timer: setTimeout(() => cleanupFlow(login), 300 * 1000)
-        });
-
-        return {
-            success: false,
-            needsVerification: true,
-            message: 'Требуется код подтверждения. Отправьте его в следующем запросе.'
-        };
+    // 🆕 ДЕБАГ: Сохраняем HTML страницы в файл
+    try {
+        const htmlContent = await page.content();
+        const timestamp = Date.now();
+        const sanitizedLogin = login.replace(/[^a-zA-Z0-9]/g, '_');
+        const htmlFilename = `${sanitizedLogin}_verification_page_${timestamp}.html`;
+        const htmlPath = path.join(DEBUG_DIR, htmlFilename);
+        
+        fs.writeFileSync(htmlPath, htmlContent, 'utf8');
+        console.log(`📄 HTML страницы сохранен: ${htmlFilename}`);
+        console.log(`📏 Размер HTML: ${htmlContent.length} байт`);
+    } catch (e) {
+        console.error('⚠️ Ошибка сохранения HTML:', e);
     }
 
-    await takeDebugScreenshot(page, login, '11_login_success');
-    console.log('✅ Вход выполнен успешно');
+    // 🆕 ДЕБАГ: Выводим информацию о найденных кнопках
+    const buttonsInfo = await page.evaluate(() => {
+        const buttons = Array.from(document.querySelectorAll('button'));
+        return buttons.map((btn, idx) => ({
+            index: idx,
+            text: btn.textContent?.trim(),
+            type: btn.getAttribute('type'),
+            class: btn.getAttribute('class'),
+            id: btn.getAttribute('id'),
+            visible: btn.offsetWidth > 0 && btn.offsetHeight > 0
+        }));
+    });
+    console.log('🔍 Найденные кнопки на странице:', JSON.stringify(buttonsInfo, null, 2));
 
-    return { success: true, browser, page };
+    // 🆕 УЛУЧШЕННЫЙ поиск кнопки отправки SMS
+    console.log('📤 Ищем кнопку отправки кода...');
+    
+    let smsButtonClicked = false;
+
+    // Способ 1: Текст содержит "Отправить код"
+    try {
+        const [sendBtn1] = await page.$x("//button[contains(text(), 'Отправить код')]");
+        if (sendBtn1) {
+            console.log('✅ Найдена кнопка через XPath (contains "Отправить код")');
+            await sendBtn1.click();
+            smsButtonClicked = true;
+            console.log('📤 SMS запрошена (способ 1)');
+        }
+    } catch (e) {
+        console.log('⚠️ Способ 1 не сработал');
+    }
+
+    // Способ 2: Если не нашли, ищем по частичному тексту "телефон"
+    if (!smsButtonClicked) {
+        try {
+            const [sendBtn2] = await page.$x("//button[contains(text(), 'телефон')]");
+            if (sendBtn2) {
+                console.log('✅ Найдена кнопка через XPath (contains "телефон")');
+                await sendBtn2.click();
+                smsButtonClicked = true;
+                console.log('📤 SMS запрошена (способ 2)');
+            }
+        } catch (e) {
+            console.log('⚠️ Способ 2 не сработал');
+        }
+    }
+
+    // Способ 3: Ищем серую кнопку (по классу)
+    if (!smsButtonClicked) {
+        try {
+            // На вашем скриншоте это серая кнопка, возможно с классом типа btn_gray
+            const grayButton = await page.$('button.bzr-btn_style_default');
+            if (grayButton) {
+                const buttonText = await page.evaluate(el => el.textContent, grayButton);
+                console.log(`✅ Найдена серая кнопка с текстом: "${buttonText?.trim()}"`);
+                
+                if (buttonText?.includes('телефон') || buttonText?.includes('код')) {
+                    await grayButton.click();
+                    smsButtonClicked = true;
+                    console.log('📤 SMS запрошена (способ 3)');
+                }
+            }
+        } catch (e) {
+            console.log('⚠️ Способ 3 не сработал');
+        }
+    }
+
+    // Способ 4: Кликаем по второй кнопке (если первая - Telegram)
+    if (!smsButtonClicked) {
+        try {
+            const allButtons = await page.$$('button');
+            console.log(`🔍 Всего кнопок на странице: ${allButtons.length}`);
+            
+            if (allButtons.length >= 2) {
+                // Обычно первая кнопка - Telegram, вторая - SMS
+                const secondButton = allButtons[1];
+                const buttonText = await page.evaluate(el => el.textContent, secondButton);
+                console.log(`🔘 Пробуем кликнуть вторую кнопку: "${buttonText?.trim()}"`);
+                
+                await secondButton.click();
+                smsButtonClicked = true;
+                console.log('📤 SMS запрошена (способ 4)');
+            }
+        } catch (e) {
+            console.log('⚠️ Способ 4 не сработал');
+        }
+    }
+
+    // Способ 5: Человеческий клик по координатам (если известны из скриншота)
+    if (!smsButtonClicked) {
+        try {
+            console.log('⚠️ Все способы не сработали, пробуем клик по координатам...');
+            // Координаты серой кнопки на вашем скриншоте (примерно)
+            await page.mouse.click(682, 404); // Центр серой кнопки
+            smsButtonClicked = true;
+            console.log('📤 SMS запрошена (способ 5 - координаты)');
+        } catch (e) {
+            console.log('⚠️ Способ 5 не сработал');
+        }
+    }
+
+    if (!smsButtonClicked) {
+        console.error('❌ Не удалось нажать кнопку отправки SMS ни одним способом!');
+        await takeDebugScreenshot(page, login, '09_5_sms_button_not_found');
+    }
+
+    // Ждем после клика
+    await new Promise(r => setTimeout(r, 2000));
+    await takeDebugScreenshot(page, login, '10_sms_requested');
+
+    // Сохраняем flow для последующего ввода кода
+    activeFlows.set(login, {
+        browser, 
+        page,
+        timestamp: Date.now(),
+        timer: setTimeout(() => cleanupFlow(login), 300 * 1000)
+    });
+
+    return {
+        success: false,
+        needsVerification: true,
+        message: 'Требуется код подтверждения. Отправьте его в следующем запросе.'
+    };
+}
+
+// Если код не требуется - успешный вход
+await takeDebugScreenshot(page, login, '11_login_success');
+console.log('✅ Вход выполнен успешно');
+
+return { success: true, browser, page };
+
 }
 
 async function humanClick(page: any, selector: string) {
