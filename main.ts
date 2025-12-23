@@ -358,37 +358,77 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
         throw e;
     }
 
-    const loginInputSelector = 'input[name="sign"]';
-    try {
-        await page.waitForSelector(loginInputSelector, { visible: true, timeout: 30000 });
-        await takeDebugScreenshot(page, login, '04_login_field_found');
+const loginInputSelector = 'input[name="sign"]';
+try {
+    // Ждем появления поля логина
+    await page.waitForSelector(loginInputSelector, { visible: true, timeout: 30000 });
+    console.log('✅ Поле логина найдено');
+    await takeDebugScreenshot(page, login, '04_login_field_found');
 
-        await page.type(loginInputSelector, login, { delay: 100 });
-        await humanDelay(500, 1500);
-        await takeDebugScreenshot(page, login, '05_login_entered');
+    // Вводим логин
+    console.log('⌨️ Ввод логина...');
+    await page.click(loginInputSelector); // Фокус на поле
+    await new Promise(r => setTimeout(r, 500));
+    await page.type(loginInputSelector, login, { delay: 100 + Math.random() * 50 });
+    await new Promise(r => setTimeout(r, 500));
+    await takeDebugScreenshot(page, login, '05_login_entered');
 
-        await page.type('input[type="password"]', password, { delay: 100 });
+    // Вводим пароль
+    console.log('⌨️ Ввод пароля...');
+    const passwordSelector = 'input[type="password"]';
+    await page.click(passwordSelector); // Фокус на поле
+    await new Promise(r => setTimeout(r, 500));
+    await page.type(passwordSelector, password, { delay: 100 + Math.random() * 50 });
+    await new Promise(r => setTimeout(r, 800));
+    await takeDebugScreenshot(page, login, '06_password_entered');
+
+    // Нажимаем кнопку входа (УЛУЧШЕННЫЙ СПОСОБ)
+    console.log('🔘 Поиск кнопки входа...');
+    
+    // Проверяем существование кнопки
+    const buttonExists = await page.$('#signbutton');
+    if (buttonExists) {
+        console.log('✅ Найдена кнопка #signbutton');
+        
+        // Скроллим к кнопке (если нужно)
+        await page.evaluate(() => {
+            const btn = document.querySelector('#signbutton');
+            if (btn) btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        });
+        
         await new Promise(r => setTimeout(r, 500));
-        await takeDebugScreenshot(page, login, '06_password_entered');
-
-        const [button] = await page.$$("xpath/.//button[contains(., 'Войти с паролем')]");
-        if (button) {
-            await button.click();
-            console.log('✅ Кнопка "Войти с паролем" нажата');
-        } else {
-             await page.click('button[type="submit"]');
-             console.log('✅ Кнопка submit нажата (fallback)');
-        }
-
-        await new Promise(r => setTimeout(r, 3000));
-        await takeDebugScreenshot(page, login, '07_after_login_click');
-
-    } catch (e) {
-        console.error("❌ Ошибка при вводе логина:", e);
-        await takeDebugScreenshot(page, login, '08_login_input_error');
-        await browser.close();
-        throw e;
+        
+        // Кликаем
+        await page.click('#signbutton');
+        console.log('✅ Клик по кнопке входа выполнен');
+        
+    } else {
+        console.log('⚠️ Кнопка #signbutton не найдена, пробуем fallback');
+        await page.click('button[type="submit"]');
+        console.log('✅ Клик по button[type="submit"] выполнен');
     }
+
+    // Ждем реакции страницы (навигация, появление кода или просто задержка)
+    console.log('⏳ Ожидание реакции после клика...');
+    await Promise.race([
+        page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 10000 })
+            .then(() => console.log('✅ Произошла навигация'))
+            .catch(() => console.log('⚠️ Навигация не обнаружена')),
+        page.waitForSelector('input[name="code"]', { timeout: 10000 })
+            .then(() => console.log('✅ Появилось поле для кода'))
+            .catch(() => console.log('⚠️ Поле кода не появилось')),
+        new Promise(r => setTimeout(r, 5000))
+    ]);
+
+    await takeDebugScreenshot(page, login, '07_after_login_click');
+
+} catch (e: any) {
+    console.error('❌ Ошибка при вводе логина/пароля:', e.message);
+    await takeDebugScreenshot(page, login, '08_login_input_error');
+    await browser.close();
+    throw e;
+}
+
 
     // 3. Проверка 2FA
     const currentUrl = page.url();
