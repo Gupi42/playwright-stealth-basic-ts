@@ -143,6 +143,219 @@ async function saveStateAndClose(login: string, browser: any, page: any, skipLog
     }
 }
 
+async function completeLoginFlow(login: string, code: string) {
+    const flow = activeFlows.get(login);
+    if (!flow) throw new Error('Сессия не найдена или истекла. Повторите запрос.');
+
+    console.log(`✍️ Вводим код для ${login}...`);
+    const { page } = flow;
+
+    try {
+        const codeInputSelector = 'input[name="code"]';
+        await page.waitForSelector(codeInputSelector, { visible: true, timeout: 5000 });
+        await page.type(codeInputSelector, code, { delay: 100 });
+        
+        await new Promise(r => setTimeout(r, Math.random() * 500 + 200));
+
+        // Нажимаем подтвердить
+        const [confirmBtn] = await page.$$("xpath/.//button[contains(., 'Подтвердить') or contains(., 'Войти')]");
+        if (confirmBtn) {
+            await confirmBtn.click();
+        } else {
+            await page.keyboard.press('Enter');
+        }
+
+        // Ждем перехода
+        await page.waitForFunction(() => window.location.href.includes('/personal'), { timeout: 15000 });
+
+        console.log('🎉 Успешный вход!');
+        clearTimeout(flow.timer);
+        activeFlows.delete(login);
+
+        return { success: true, browser: flow.browser, page: flow.page };
+
+    } catch (error) {
+        await page.screenshot({ path: path.join(DEBUG_DIR, `error_code_${Date.now()}.png`) });
+        throw new Error('Неверный код или ошибка сайта');
+    }
+}
+
+async function startLoginFlow(login: string, password: string, proxyUrl?: string) {
+    await cleanupFlow(login);
+
+    let proxyConfig = null;
+    let proxyServerArg = undefined;
+
+    // Парсим прокси
+    const proxyToUse = proxyUrl || GLOBAL_PROXY_URL;
+    if (proxyToUse) {
+        proxyConfig = parseProxy(proxyToUse);
+        if (proxyConfig) {
+            proxyServerArg = proxyConfig.server; // Только http://ip:port
+            console.log(`🌐 Прокси: ${proxyServerArg}`);
+        }
+    }
+
+    const browser = await getBrowserInstance(proxyServerArg);
+    const page = await browser.newPage();
+
+    // ВАЖНО: Авторизация на прокси
+    if (proxyConfig && proxyConfig.username && proxyConfig.password) {
+        console.log('🔑 Авторизация на прокси...');
+        await page.authenticate({
+            username: proxyConfig.username,
+            password: proxyConfig.password
+        });
+    }
+    
+    await page.setViewport({ width: 1366, height: 768 });
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36');
+
+    // Блокировка ресурсов
+    await page.setRequestInterception(true);
+    page.on('request', (req: any) => {
+        const type = req.resourceType();
+        if (['image', 'font', 'media', 'stylesheet'].includes(type)) {
+            req.abort();
+        } else {
+            req.continue();
+        }
+    });
+
+    // 1. Попытка восстановить сессию
+    const sessionPath = getSessionPath(login);
+    if (fs.existsSync(sessionPath)) {
+        try {
+            const state = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+            const stats = fs.statSync(sessionPath);
+
+            // Сессия моложе 30 дней
+            if (Date.now() - stats.mtimeMs < 30 * 24 * 60 * 60 * 1000) {
+                if (state.cookies && Array.isArray(state.cookies)) {
+                    await page.setCookie(...state.cookies);
+                }
+                
+                // LocalStorage restore logic if needed (complex in puppeteer without context)
+                // Puppeteer не имеет метода addInitScript как Playwright в явном виде для контекста,
+                // но можно использовать evaluateOnNewDocument
+                if (state.localStorage) {
+                     await page.evaluateOnNewDocument((data: any) => {
+                        localStorage.clear();
+                        data.forEach((item: any) => localStorage.setItem(item.name, item.value));
+                    }, state.localStorage);
+                }
+
+                console.log(`🔄 Пробуем восстановить сессию для ${login}...`);
+                
+                try {
+                   await page.goto('https://my.drom.ru/personal/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+                   
+                   // Проверка, не выкинуло ли на логин
+                   if (!page.url().includes('sign')) {
+                        console.log('✅ Сессия восстановлена');
+                        return { success: true, browser, page };
+                   }
+                } catch(e) {
+                   console.log('⚠️ Ошибка при переходе с куками:', e);
+                }
+            }
+            console.log('⚠️ Сессия устарела или невалидна, нужен ре-логин');
+        } catch (e) { 
+            console.error('Ошибка чтения сессии', e); 
+        }
+    }
+
+    // 2. Вход с паролем
+    console.log('🔐 Входим по логину/паролю...');
+    await page.goto('https://my.drom.ru/sign', { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+    const loginInputSelector = 'input[name="sign"]';
+    try {
+        await page.waitForSelector(loginInputSelector, { visible: true, timeout: 15000 });
+        await page.type(loginInputSelector, login, { delay: 100 });
+        await new Promise(r => setTimeout(r, 300));
+        
+        await page.type('input[type="password"]', password, { delay: 100 });
+        await new Promise(r => setTimeout(r, 500));
+
+        // Ищем кнопку "Войти с паролем"
+        // Puppeteer не имеет псевдо-селекторов :has-text, используем xpath или evaluate
+        const [button] = await page.$$("xpath/.//button[contains(., 'Войти с паролем')]");
+        if (button) {
+            await button.click();
+        } else {
+             // Fallback если текст другой
+             await page.click('button[type="submit"]');
+        }
+
+        await new Promise(r => setTimeout(r, 3000));
+        
+    } catch (e) {
+        console.error("Ошибка при вводе логина:", e);
+        await browser.close();
+        throw e;
+    }
+
+    // 3. Проверка 2FA
+    const currentUrl = page.url();
+    // const bodyText = await page.$eval('body', (el:any) => el.innerText); 
+    // ^ это может быть долго, проще проверить наличие элементов
+    
+    // Проверяем наличие поля ввода кода
+    const codeInput = await page.$('input[name="code"]');
+    
+    if (codeInput || currentUrl.includes('/sign')) { 
+        // Если мы все еще на /sign и есть намек на код
+        console.log('📱 Drom запрашивает код подтверждения');
+        
+        // Поиск кнопки отправить код (если она есть)
+        const [sendBtn] = await page.$$("xpath/.//div[contains(text(), 'Отправить код')] | //button[contains(text(), 'Отправить код')]");
+        if (sendBtn) {
+            await sendBtn.click();
+            console.log('SMS запрошена');
+        }
+
+        activeFlows.set(login, {
+            browser, 
+            page,
+            timestamp: Date.now(),
+            timer: setTimeout(() => cleanupFlow(login), 300 * 1000)
+        });
+
+        return {
+            success: false,
+            needsVerification: true,
+            message: 'Требуется код подтверждения. Отправьте его в следующем запросе.'
+        };
+    }
+
+    return { success: true, browser, page };
+}
+
+async function humanClick(page: any, selector: string) {
+    try {
+        await page.waitForSelector(selector, { visible: true, timeout: 5000 });
+        const element = await page.$(selector);
+        
+        if (element) {
+            const box = await element.boundingBox();
+            if (box) {
+                await page.mouse.move(
+                    box.x + box.width / 2 + (Math.random() - 0.5) * 10,
+                    box.y + box.height / 2 + (Math.random() - 0.5) * 10,
+                    { steps: 10 }
+                );
+                await new Promise(r => setTimeout(r, Math.random() * 200 + 100));
+                await element.click();
+                return true;
+            }
+        }
+    } catch (e) {
+        // Element not found or not visible
+    }
+    return false;
+}
+
 // 🆕 УЛУЧШЕННАЯ ФУНКЦИЯ ОЧИСТКИ КОНТЕКСТА ПЕРЕД ЗАГРУЗКОЙ НОВОЙ СЕССИИ
 async function clearBrowserContext(page: any): Promise<void> {
     try {
