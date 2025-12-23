@@ -7,23 +7,11 @@ import * as fs from 'fs';
 import * as path from 'path';
 import 'dotenv/config';
 
+// 1. Активируем скрытность
 puppeteer.use(StealthPlugin());
 
 const app = express();
 app.use(express.json());
-// Хелпер для парсинга прокси
-function parseProxy(proxyUrl: string) {
-    try {
-        const url = new URL(proxyUrl);
-        return {
-            server: `${url.protocol}//${url.hostname}:${url.port}`,
-            username: url.username,
-            password: url.password
-        };
-    } catch (e) {
-        return null;
-    }
-}
 
 // === 🛡️ ЗАЩИТА (MIDDLEWARE) ===
 app.use((req, res, next) => {
@@ -52,6 +40,7 @@ const DEBUG_DIR = path.join(DATA_DIR, 'debug');
 if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 if (!fs.existsSync(DEBUG_DIR)) fs.mkdirSync(DEBUG_DIR, { recursive: true });
 
+// Глобальный прокси (резервный)
 const GLOBAL_PROXY_URL = process.env.PROXY_URL;
 
 // --- ХЕЛПЕРЫ ---
@@ -76,88 +65,424 @@ async function cleanupFlow(login: string) {
         clearTimeout(flow.timer);
         try {
             await flow.browser.close();
-        } catch (e) {
-            console.error('Ошибка при закрытии браузера:', e);
-        }
+        } catch (e) {}
         activeFlows.delete(login);
     }
 }
-async function humanDelay(min: number = 1000, max: number = 3000) {
-    const delay = Math.floor(Math.random() * (max - min + 1)) + min;
-    await new Promise(r => setTimeout(r, delay));
-}
 
-// 🆕 УЛУЧШЕННАЯ ФУНКЦИЯ ЛОГАУТА
-async function performLogout(page: any, login: string): Promise<void> {
+async function humanClick(page: any, selector: string) {
     try {
-        console.log(`🚪 Выполняется логаут для ${login}...`);
-
-        // Переходим на страницу логаута
-        await page.goto('https://my.drom.ru/logout?return=https%3A%2F%2Fauto.drom.ru%2Favtoline38%2F%3Ftcb%3D1766397803', {
-            waitUntil: 'networkidle2',
-            timeout: 30000
-        });
-
-        await new Promise(r => setTimeout(r, 2000));
-
-        // Очищаем cookies и localStorage
-        const cookies = await page.cookies();
-        if (cookies.length > 0) {
-            await page.deleteCookie(...cookies);
-        }
-
-        await page.evaluate(() => {
-            localStorage.clear();
-            sessionStorage.clear();
-        });
-
-        console.log(`✅ Логаут выполнен для ${login}`);
-    } catch (error: any) {
-        console.error(`⚠️ Ошибка при логауте для ${login}:`, error.message);
-        // Даже если логаут не удался, очищаем локальные данные
-        try {
-            const cookies = await page.cookies();
-            if (cookies.length > 0) {
-                await page.deleteCookie(...cookies);
+        await page.waitForSelector(selector, { visible: true, timeout: 5000 });
+        const element = await page.$(selector);
+        
+        if (element) {
+            const box = await element.boundingBox();
+            if (box) {
+                await page.mouse.move(
+                    box.x + box.width / 2 + (Math.random() - 0.5) * 10,
+                    box.y + box.height / 2 + (Math.random() - 0.5) * 10,
+                    { steps: 10 }
+                );
+                await new Promise(r => setTimeout(r, Math.random() * 200 + 100));
+                await element.click();
+                return true;
             }
-            await page.evaluate(() => {
-                localStorage.clear();
-                sessionStorage.clear();
-            });
-        } catch (e) {
-            console.error('Критическая ошибка очистки:', e);
         }
-    }
-}
-
-// 🆕 УЛУЧШЕННАЯ ФУНКЦИЯ СОХРАНЕНИЯ СОСТОЯНИЯ
-async function saveStateAndClose(login: string, browser: any, page: any, skipLogout: boolean = false) {
-    try {
-        const cookies = await page.cookies();
-        const localStorageData = await page.evaluate(() => {
-            const data: any[] = [];
-            for (let i = 0; i < localStorage.length; i++) {
-                const key = localStorage.key(i);
-                if (key) data.push({ name: key, value: localStorage.getItem(key) });
-            }
-            return data;
-        });
-
-        const state = { 
-            cookies, 
-            localStorage: localStorageData,
-            login: login, // 🆕 Сохраняем логин для проверки
-            timestamp: Date.now() // 🆕 Время последнего сохранения
-        };
-        fs.writeFileSync(getSessionPath(login), JSON.stringify(state, null, 2));
-        console.log(`💾 Сессия сохранена для ${login}`);
     } catch (e) {
-        console.error('Ошибка сохранения сессии:', e);
-    } finally {
-        if (!skipLogout) {
-            await browser.close().catch(() => {});
+        // Element not found or not visible
+    }
+    return false;
+}
+
+// Хелпер для парсинга прокси
+function parseProxy(proxyUrl: string) {
+    try {
+        const url = new URL(proxyUrl);
+        return {
+            server: `${url.protocol}//${url.hostname}:${url.port}`,
+            username: url.username,
+            password: url.password
+        };
+    } catch (e) {
+        return null;
+    }
+}
+
+// --- ОСНОВНАЯ ЛОГИКА БРАУЗЕРА ---
+
+async function getBrowserInstance(proxyServer?: string) {
+    const launchOptions: any = {
+        headless: "new",
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--window-size=1366,768'
+        ],
+        ignoreHTTPSErrors: true,
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH
+    };
+
+    if (proxyServer) {
+        launchOptions.args.push(`--proxy-server=${proxyServer}`);
+    }
+
+    return await puppeteer.launch(launchOptions);
+}
+
+async function startLoginFlow(login: string, password: string, proxyUrl?: string) {
+    await cleanupFlow(login);
+
+    let proxyConfig = null;
+    let proxyServerArg = undefined;
+
+    // Парсим прокси
+    const proxyToUse = proxyUrl || GLOBAL_PROXY_URL;
+    if (proxyToUse) {
+        proxyConfig = parseProxy(proxyToUse);
+        if (proxyConfig) {
+            proxyServerArg = proxyConfig.server; // Только http://ip:port
+            console.log(`🌐 Прокси: ${proxyServerArg}`);
         }
     }
+
+    const browser = await getBrowserInstance(proxyServerArg);
+    const page = await browser.newPage();
+
+    // ВАЖНО: Авторизация на прокси
+    if (proxyConfig && proxyConfig.username && proxyConfig.password) {
+        console.log('🔑 Авторизация на прокси...');
+        await page.authenticate({
+            username: proxyConfig.username,
+            password: proxyConfig.password
+        });
+    }
+    
+    await page.setViewport({ width: 1366, height: 768 });
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36');
+
+    // Блокировка ресурсов
+    await page.setRequestInterception(true);
+    page.on('request', (req: any) => {
+        const type = req.resourceType();
+        if (['image', 'font', 'media', 'stylesheet'].includes(type)) {
+            req.abort();
+        } else {
+            req.continue();
+        }
+    });
+
+    // 1. Попытка восстановить сессию
+    const sessionPath = getSessionPath(login);
+    if (fs.existsSync(sessionPath)) {
+        try {
+            const state = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+            const stats = fs.statSync(sessionPath);
+
+            // Сессия моложе 30 дней
+            if (Date.now() - stats.mtimeMs < 30 * 24 * 60 * 60 * 1000) {
+                if (state.cookies && Array.isArray(state.cookies)) {
+                    await page.setCookie(...state.cookies);
+                }
+                
+                // LocalStorage restore logic if needed (complex in puppeteer without context)
+                // Puppeteer не имеет метода addInitScript как Playwright в явном виде для контекста,
+                // но можно использовать evaluateOnNewDocument
+                if (state.localStorage) {
+                     await page.evaluateOnNewDocument((data: any) => {
+                        localStorage.clear();
+                        data.forEach((item: any) => localStorage.setItem(item.name, item.value));
+                    }, state.localStorage);
+                }
+
+                console.log(`🔄 Пробуем восстановить сессию для ${login}...`);
+                
+                try {
+                   await page.goto('https://my.drom.ru/personal/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+                   
+                   // Проверка, не выкинуло ли на логин
+                   if (!page.url().includes('sign')) {
+                        console.log('✅ Сессия восстановлена');
+                        return { success: true, browser, page };
+                   }
+                } catch(e) {
+                   console.log('⚠️ Ошибка при переходе с куками:', e);
+                }
+            }
+            console.log('⚠️ Сессия устарела или невалидна, нужен ре-логин');
+        } catch (e) { 
+            console.error('Ошибка чтения сессии', e); 
+        }
+    }
+
+    // 2. Вход с паролем
+    console.log('🔐 Входим по логину/паролю...');
+    await page.goto('https://my.drom.ru/sign', { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+    const loginInputSelector = 'input[name="sign"]';
+    try {
+        await page.waitForSelector(loginInputSelector, { visible: true, timeout: 15000 });
+        await page.type(loginInputSelector, login, { delay: 100 });
+        await new Promise(r => setTimeout(r, 300));
+        
+        await page.type('input[type="password"]', password, { delay: 100 });
+        await new Promise(r => setTimeout(r, 500));
+
+        // Ищем кнопку "Войти с паролем"
+        // Puppeteer не имеет псевдо-селекторов :has-text, используем xpath или evaluate
+        const [button] = await page.$$("xpath/.//button[contains(., 'Войти с паролем')]");
+        if (button) {
+            await button.click();
+        } else {
+             // Fallback если текст другой
+             await page.click('button[type="submit"]');
+        }
+
+        await new Promise(r => setTimeout(r, 3000));
+        
+    } catch (e) {
+        console.error("Ошибка при вводе логина:", e);
+        await browser.close();
+        throw e;
+    }
+
+// 4. Проверка 2FA
+const currentUrl = page.url();
+console.log(`📍 Текущий URL: ${currentUrl}`);
+await takeDebugScreenshot(page, login, '08_checking_2fa');
+
+const codeInput = await page.$('input[name="code"]');
+
+if (codeInput || currentUrl.includes('/sign')) { 
+    console.log('📱 Drom запрашивает код подтверждения');
+    await takeDebugScreenshot(page, login, '09_verification_required');
+
+    // Проверяем, какая страница перед нами
+    const pageTitle = await page.evaluate(() => document.title);
+    const pageText = await page.evaluate(() => document.body.innerText);
+    
+    console.log(`📄 Заголовок страницы: ${pageTitle}`);
+    console.log(`📝 Текст содержит "Получить СМС-код": ${pageText.includes('Получить СМС-код')}`);
+    console.log(`📝 Текст содержит "Проверить через Telegram": ${pageText.includes('Проверить через Telegram')}`);
+
+    let verificationMethodSelected = false;
+
+    // ========== ПРИОРИТЕТ: TELEGRAM ==========
+    
+    // Способ 1: Кнопка "Проверить через Telegram"
+    if (!verificationMethodSelected) {
+        try {
+            console.log('📱 Способ 1: Ищем кнопку Telegram...');
+            
+            const [telegramBtn] = await page.$x("//button[contains(normalize-space(.), 'Telegram') or contains(normalize-space(.), 'телеграм')]");
+            
+            if (telegramBtn) {
+                console.log('✅ Найдена кнопка Telegram через XPath');
+                
+                await Promise.all([
+                    telegramBtn.click(),
+                    page.waitForNavigation({ 
+                        waitUntil: 'domcontentloaded', 
+                        timeout: 10000 
+                    }).catch(() => console.log('⚠️ Навигация не произошла'))
+                ]);
+                
+                verificationMethodSelected = true;
+                console.log('✅ Выбран метод: Telegram');
+            } else {
+                console.log('⚠️ Способ 1: Кнопка Telegram не найдена');
+            }
+        } catch (e: any) {
+            console.log('⚠️ Способ 1 ошибка:', e.message);
+        }
+    }
+
+    // Способ 2: Ссылка Telegram (синяя кнопка)
+    if (!verificationMethodSelected) {
+        try {
+            console.log('📱 Способ 2: Ищем ссылку Telegram с классом bzr-btn_style_info...');
+            
+            // Из предыдущих логов видно, что Telegram - это синяя кнопка
+            const telegramLink = await page.$('a.bzr-btn_style_info.telegram-send-phone-btn');
+            
+            if (telegramLink) {
+                const linkText = await page.evaluate(el => el.textContent?.trim(), telegramLink);
+                const linkHref = await page.evaluate(el => el.getAttribute('href'), telegramLink);
+                
+                console.log(`✅ Найдена ссылка Telegram: "${linkText}", href: "${linkHref}"`);
+                
+                await Promise.all([
+                    telegramLink.click(),
+                    page.waitForNavigation({ 
+                        waitUntil: 'domcontentloaded', 
+                        timeout: 10000 
+                    }).catch(() => console.log('⚠️ Навигация не произошла'))
+                ]);
+                
+                verificationMethodSelected = true;
+                console.log('✅ Выбран метод: Telegram (ссылка)');
+            } else {
+                console.log('⚠️ Способ 2: Ссылка Telegram не найдена');
+            }
+        } catch (e: any) {
+            console.log('⚠️ Способ 2 ошибка:', e.message);
+        }
+    }
+
+    // Способ 3: Любая ссылка с текстом "Telegram"
+    if (!verificationMethodSelected) {
+        try {
+            console.log('📱 Способ 3: Ищем любую ссылку с "Telegram"...');
+            
+            const [telegramLink] = await page.$x("//a[contains(normalize-space(.), 'Telegram')]");
+            
+            if (telegramLink) {
+                console.log('✅ Найдена ссылка с Telegram через XPath');
+                
+                await Promise.all([
+                    telegramLink.click(),
+                    page.waitForNavigation({ 
+                        waitUntil: 'domcontentloaded', 
+                        timeout: 10000 
+                    }).catch(() => console.log('⚠️ Навигация не произошла'))
+                ]);
+                
+                verificationMethodSelected = true;
+                console.log('✅ Выбран метод: Telegram (XPath)');
+            }
+        } catch (e: any) {
+            console.log('⚠️ Способ 3 ошибка:', e.message);
+        }
+    }
+
+    // Способ 4: Кнопка "Получить СМС-код" (со скриншота)
+    if (!verificationMethodSelected) {
+        try {
+            console.log('📱 Способ 4: Ищем кнопку "Получить СМС-код"...');
+            
+            const [smsButton] = await page.$x("//button[contains(normalize-space(.), 'Получить СМС-код')]");
+            
+            if (smsButton) {
+                console.log('✅ Найдена кнопка "Получить СМС-код"');
+                
+                await Promise.all([
+                    smsButton.click(),
+                    page.waitForNavigation({ 
+                        waitUntil: 'domcontentloaded', 
+                        timeout: 10000 
+                    }).catch(() => console.log('⚠️ Навигация не произошла'))
+                ]);
+                
+                verificationMethodSelected = true;
+                console.log('✅ Выбран метод: SMS (кнопка)');
+            }
+        } catch (e: any) {
+            console.log('⚠️ Способ 4 ошибка:', e.message);
+        }
+    }
+
+    // ========== FALLBACK: SMS (как раньше) ==========
+    
+    // Способ 5: Серая кнопка "Отправить код на телефон"
+    if (!verificationMethodSelected) {
+        try {
+            console.log('📱 Способ 5: Ищем ссылку "Отправить код на телефон"...');
+            
+            const smsLink = await page.$('a.bzr-btn:not(.bzr-btn_style_info)');
+            
+            if (smsLink) {
+                const linkText = await page.evaluate(el => el.textContent?.trim(), smsLink);
+                console.log(`✅ Найдена ссылка SMS: "${linkText}"`);
+                
+                await Promise.all([
+                    smsLink.click(),
+                    page.waitForNavigation({ 
+                        waitUntil: 'domcontentloaded', 
+                        timeout: 10000 
+                    }).catch(() => console.log('⚠️ Навигация не произошла'))
+                ]);
+                
+                verificationMethodSelected = true;
+                console.log('✅ Выбран метод: SMS (ссылка)');
+            }
+        } catch (e: any) {
+            console.log('⚠️ Способ 5 ошибка:', e.message);
+        }
+    }
+
+    // Способ 6: Прямой переход на SMS endpoint
+    if (!verificationMethodSelected) {
+        try {
+            console.log('📱 Способ 6: Прямой переход на SMS endpoint...');
+            
+            const smsHref = await page.evaluate(() => {
+                const links = Array.from(document.querySelectorAll('a'));
+                for (const link of links) {
+                    const href = link.getAttribute('href') || '';
+                    const text = link.textContent?.trim().toLowerCase() || '';
+                    
+                    if (href.includes('/sms') || text.includes('телефон')) {
+                        return href;
+                    }
+                }
+                return null;
+            });
+            
+            if (smsHref) {
+                const absoluteUrl = smsHref.startsWith('http') 
+                    ? smsHref 
+                    : new URL(smsHref, 'https://my.drom.ru').href;
+                
+                console.log(`✅ Найден SMS href: ${absoluteUrl}`);
+                
+                await page.goto(absoluteUrl, { 
+                    waitUntil: 'domcontentloaded',
+                    timeout: 10000 
+                });
+                
+                verificationMethodSelected = true;
+                console.log('✅ Выбран метод: SMS (прямой переход)');
+            }
+        } catch (e: any) {
+            console.log('⚠️ Способ 6 ошибка:', e.message);
+        }
+    }
+
+    if (!verificationMethodSelected) {
+        console.error('❌ Не удалось выбрать метод верификации!');
+        await takeDebugScreenshot(page, login, '09_5_no_verification_method');
+    } else {
+        console.log('✅ Метод верификации выбран успешно!');
+    }
+
+    // Ждём загрузки следующей страницы
+    await new Promise(r => setTimeout(r, 3000));
+    await takeDebugScreenshot(page, login, '10_verification_method_selected');
+    
+    // Проверяем результат
+    const currentUrlAfter = page.url();
+    const codeInputAfter = await page.$('input[name="code"]');
+    
+    console.log(`📍 URL после выбора: ${currentUrlAfter}`);
+    console.log(`📝 Поле кода ${codeInputAfter ? 'появилось ✅' : 'не появилось ❌'}`);
+
+    activeFlows.set(login, {
+        browser, 
+        page,
+        timestamp: Date.now(),
+        timer: setTimeout(() => cleanupFlow(login), 300 * 1000)
+    });
+
+    return {
+        success: false,
+        needsVerification: true,
+        message: 'Код отправлен. Проверьте Telegram или SMS и отправьте код в следующем запросе.',
+        method: verificationMethodSelected ? 'telegram_or_sms' : 'unknown'
+    };
+}
+
+
+    return { success: true, browser, page };
 }
 
 async function completeLoginFlow(login: string, code: string) {
@@ -183,7 +508,7 @@ async function completeLoginFlow(login: string, code: string) {
         }
 
         // Ждем перехода
-        await page.waitForFunction(() => window.location.href.includes('/personal'), { timeout: 30000 });
+        await page.waitForFunction(() => window.location.href.includes('/personal'), { timeout: 15000 });
 
         console.log('🎉 Успешный вход!');
         clearTimeout(flow.timer);
@@ -196,887 +521,31 @@ async function completeLoginFlow(login: string, code: string) {
         throw new Error('Неверный код или ошибка сайта');
     }
 }
-// ===== ВЫНЕСИТЕ ЭТУ ФУНКЦИЮ ЗА ПРЕДЕЛЫ startLoginFlow =====
-// Разместите её ПЕРЕД функцией startLoginFlow на уровне модуля
-async function takeDebugScreenshot(page: any, login: string, step: string) {
+
+async function saveStateAndClose(login: string, browser: any, page: any) {
     try {
-        const timestamp = Date.now();
-        const sanitizedLogin = login.replace(/[^a-zA-Z0-9]/g, '_');
-        const filename = `${sanitizedLogin}_${step}_${timestamp}.png`;
-        const filepath = path.join(DEBUG_DIR, filename);
-
-        await page.screenshot({ 
-            path: filepath, 
-            fullPage: true 
-        });
-
-        console.log(`📸 Скриншот сохранен: ${filename}`);
-        return filename;
-    } catch (e) {
-        console.error(`⚠️ Ошибка создания скриншота на этапе ${step}:`, e);
-        return null;
-    }
-}
-
-async function loadPageWithRetry(page: any, url: string, options: any = {}, maxRetries: number = 3) {
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-        try {
-            console.log(`🔄 Попытка ${attempt}/${maxRetries} загрузить ${url}`);
-
-            await page.goto(url, {
-                waitUntil: 'domcontentloaded',
-                timeout: 60000,
-                ...options
-            });
-
-            console.log(`✅ Страница загружена с попытки ${attempt}`);
-            return; // Успех
-
-        } catch (error: any) {
-            console.error(`❌ Попытка ${attempt} не удалась:`, error.message);
-
-            if (attempt === maxRetries) {
-                throw error; // Исчерпаны попытки
-            }
-
-            const delay = attempt * 3000;
-            console.log(`⏳ Ожидание ${delay/1000} секунд перед повтором...`);
-            await new Promise(r => setTimeout(r, delay));
-        }
-    }
-}
-
-// ===== ANTICAPTCHA INTEGRATION =====
-
-const anticaptcha = require("@antiadmin/anticaptchaofficial");
-
-// Настройка AntiCaptcha (вызовите один раз при старте)
-if (process.env.ANTICAPTCHA_API_KEY) {
-    anticaptcha.setAPIKey(process.env.ANTICAPTCHA_API_KEY);
-    console.log('✅ AntiCaptcha API key configured');
-} else {
-    console.warn('⚠️ ANTICAPTCHA_API_KEY not set in environment variables');
-}
-
-async function solveRecaptchaV2(pageUrl: string, sitekey: string): Promise<string> {
-    console.log('🤖 Отправляем reCAPTCHA v2 на решение через AntiCaptcha...');
-    console.log(`📍 URL: ${pageUrl}`);
-    console.log(`🔑 Sitekey: ${sitekey}`);
-
-    try {
-        const gresponse = await anticaptcha.solveRecaptchaV2Proxyless(pageUrl, sitekey);
-
-        console.log('✅ reCAPTCHA решена!');
-        console.log(`🎫 g-response: ${gresponse.substring(0, 50)}...`);
-
-        // Получаем cookies от AntiCaptcha (если есть)
-        const cookies = anticaptcha.getCookies();
-        if (cookies && cookies.length > 0) {
-            console.log('🍪 Получены cookies от AntiCaptcha');
-        }
-
-        return gresponse;
-
-    } catch (error: any) {
-        console.error('❌ Ошибка решения reCAPTCHA:', error);
-        throw new Error(`AntiCaptcha failed: ${error}`);
-    }
-}
-
-async function setupAntiDetection(page: any) {
-    await page.evaluateOnNewDocument(() => {
-        // 1. Удаляем webdriver
-        Object.defineProperty(navigator, 'webdriver', {
-            get: () => false,
-        });
-
-        // 2. Переопределяем permissions
-        const originalQuery = window.navigator.permissions.query;
-        window.navigator.permissions.query = (parameters: any) => (
-            parameters.name === 'notifications' ?
-                Promise.resolve({ state: Notification.permission } as PermissionStatus) :
-                originalQuery(parameters)
-        );
-
-        // 3. Chrome object
-        (window as any).chrome = {
-            runtime: {},
-            loadTimes: function() {},
-            csi: function() {},
-            app: {}
-        };
-
-        // 4. Plugins
-        Object.defineProperty(navigator, 'plugins', {
-            get: () => [
-                {
-                    0: { type: "application/x-google-chrome-pdf" },
-                    description: "Portable Document Format",
-                    filename: "internal-pdf-viewer",
-                    length: 1,
-                    name: "Chrome PDF Plugin"
-                }
-            ],
-        });
-
-        // 5. Languages
-        Object.defineProperty(navigator, 'languages', {
-            get: () => ['ru-RU', 'ru', 'en-US', 'en'],
-        });
-
-        // 6. Скрываем automation tokens
-        delete (window as any).cdc_adoQpoasnfa76pfcZLmcfl_Array;
-        delete (window as any).cdc_adoQpoasnfa76pfcZLmcfl_Promise;
-        delete (window as any).cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
-
-        // 7. Vendor
-        Object.defineProperty(navigator, 'vendor', {
-            get: () => 'Google Inc.',
-        });
-    });
-}
-
-// ===== MAIN LOGIN FLOW WITH ANTICAPTCHA =====
-
-async function startLoginFlow(login: string, password: string, proxyUrl?: string) {
-    await cleanupFlow(login);
-
-    let proxyConfig = null;
-    let proxyServerArg = undefined;
-
-    const proxyToUse = proxyUrl || GLOBAL_PROXY_URL;
-    if (proxyToUse) {
-        proxyConfig = parseProxy(proxyToUse);
-        if (proxyConfig) {
-            proxyServerArg = proxyConfig.server;
-            console.log(`🌐 Прокси: ${proxyServerArg}`);
-        }
-    }
-
-    const browser = await getBrowserInstance(proxyServerArg);
-    const page = await browser.newPage();
-
-    // Применяем anti-detection
-    await setupAntiDetection(page);
-
-    // Авторизация на прокси
-    if (proxyConfig && proxyConfig.username && proxyConfig.password) {
-        console.log('🔑 Авторизация на прокси...');
-        await page.authenticate({
-            username: proxyConfig.username,
-            password: proxyConfig.password
-        });
-    }
-
-    await page.setViewport({ width: 1366, height: 768 });
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36');
-
-    // ВРЕМЕННО ОТКЛЮЧЕНА блокировка ресурсов для стабильности
-    /*
-    await page.setRequestInterception(true);
-    page.on('request', (req: any) => {
-        const type = req.resourceType();
-        if (['image', 'font', 'media', 'stylesheet'].includes(type)) {
-            req.abort();
-        } else {
-            req.continue();
-        }
-    });
-    */
-
-    await takeDebugScreenshot(page, login, '01_initialized');
-
-    // 1. Попытка восстановить сессию
-    const sessionPath = getSessionPath(login);
-    if (fs.existsSync(sessionPath)) {
-        try {
-            const state = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
-            const stats = fs.statSync(sessionPath);
-
-            if (Date.now() - stats.mtimeMs < 30 * 24 * 60 * 60 * 1000) {
-                if (state.cookies && Array.isArray(state.cookies)) {
-                    await page.setCookie(...state.cookies);
-                }
-
-                if (state.localStorage) {
-                     await page.evaluateOnNewDocument((data: any) => {
-                        localStorage.clear();
-                        data.forEach((item: any) => localStorage.setItem(item.name, item.value));
-                    }, state.localStorage);
-                }
-
-                console.log(`🔄 Пробуем восстановить сессию для ${login}...`);
-
-                try {
-                   await loadPageWithRetry(page, 'https://my.drom.ru/personal/');
-                   await takeDebugScreenshot(page, login, '02_session_restore_attempt');
-
-                   if (!page.url().includes('sign')) {
-                        console.log('✅ Сессия восстановлена');
-                        await takeDebugScreenshot(page, login, '03_session_restored_success');
-                        return { success: true, browser, page };
-                   }
-                } catch(e) {
-                   console.log('⚠️ Ошибка при переходе с куками:', e);
-                   await takeDebugScreenshot(page, login, '02_session_restore_error');
-                }
-            }
-            console.log('⚠️ Сессия устарела или невалидна, нужен ре-логин');
-        } catch (e) { 
-            console.error('Ошибка чтения сессии', e); 
-        }
-    }
-
-    // 2. Вход с паролем
-    console.log('🔐 Входим по логину/паролю...');
-
-try {
-    await loadPageWithRetry(page, 'https://my.drom.ru/sign');
-    
-    const content = await page.content();
-    console.log(`📄 Размер загруженной страницы: ${content.length} байт`);
-    
-    if (content.length < 10000) {
-        console.warn(`⚠️ Подозрительно маленькая страница: ${content.length} байт`);
-        await takeDebugScreenshot(page, login, '03_suspicious_small_page');
-        throw new Error('Прокси вернул неполную страницу');
-    }
-
-    await takeDebugScreenshot(page, login, '03_login_page_loaded');
-
-    // ========== ОЖИДАНИЕ И ПРОВЕРКА RECAPTCHA ==========
-    console.log('🔍 Ожидание полной загрузки страницы (включая reCAPTCHA)...');
-    
-    // Ждём 5 секунд для загрузки всех асинхронных элементов (включая reCAPTCHA)
-    await new Promise(r => setTimeout(r, 5000));
-    
-    // Дополнительно ждём появления либо формы входа, либо reCAPTCHA
-    await Promise.race([
-        page.waitForSelector('input[name="sign"]', { timeout: 10000 }).catch(() => null),
-        page.waitForSelector('iframe[src*="recaptcha"]', { timeout: 10000 }).catch(() => null),
-        new Promise(r => setTimeout(r, 10000))
-    ]);
-    
-    // Делаем скриншот после ожидания
-    await takeDebugScreenshot(page, login, '03_5_after_wait');
-    
-    // ТЕПЕРЬ проверяем reCAPTCHA
-    const recaptchaFrame = await page.$('iframe[src*="recaptcha/api2"]');
-    
-    if (recaptchaFrame) {
-        console.log('🔒 Обнаружена reCAPTCHA v2!');
-        await takeDebugScreenshot(page, login, '03_6_recaptcha_detected');
-        
-        // Извлекаем sitekey
-        const sitekey = await page.evaluate(() => {
-            const iframe = document.querySelector('iframe[src*="recaptcha/api2"]') as HTMLIFrameElement;
-            if (!iframe) return null;
-            
-            const src = iframe.getAttribute('src') || '';
-            const match = src.match(/[?&]k=([^&]+)/);
-            return match ? match[1] : null;
-        });
-        
-        if (!sitekey) {
-            console.error('❌ Не удалось найти sitekey для reCAPTCHA');
-            await takeDebugScreenshot(page, login, '03_7_no_sitekey');
-            throw new Error('reCAPTCHA sitekey not found');
-        }
-        
-        console.log(`🔑 Найден sitekey: ${sitekey}`);
-        
-        // Проверяем API ключ
-        if (!process.env.ANTICAPTCHA_API_KEY) {
-            console.error('❌ ANTICAPTCHA_API_KEY не настроен!');
-            await takeDebugScreenshot(page, login, '03_8_no_api_key');
-            throw new Error('AntiCaptcha API key not configured');
-        }
-        
-        try {
-            // Решаем капчу
-            const gresponse = await solveRecaptchaV2(page.url(), sitekey);
-            
-            // Вставляем решение
-            await page.evaluate((token: string) => {
-                const textarea = document.querySelector('textarea[name="g-recaptcha-response"]') as HTMLTextAreaElement;
-                if (textarea) {
-                    textarea.innerHTML = token;
-                    textarea.value = token;
-                    textarea.style.display = 'block';
-                }
-                
-                const input = document.querySelector('input[name="g-recaptcha-response"]') as HTMLInputElement;
-                if (input) {
-                    input.value = token;
-                }
-                
-                if (typeof (window as any).grecaptcha !== 'undefined') {
-                    const clients = (window as any).___grecaptcha_cfg?.clients;
-                    if (clients) {
-                        Object.keys(clients).forEach((key) => {
-                            const client = clients[key];
-                            if (client && client.callback) {
-                                client.callback(token);
-                            }
-                        });
-                    }
-                }
-            }, gresponse);
-            
-console.log('✅ Решение reCAPTCHA вставлено');
-await new Promise(r => setTimeout(r, 1500));
-await takeDebugScreenshot(page, login, '03_9_recaptcha_solved');
-
-// Ищем форму/кнопку для submit
-console.log('📤 Поиск способа отправки формы капчи...');
-
-// Проверяем HTML страницы
-const pageHTML = await page.content();
-const hasForm = pageHTML.includes('<form');
-const hasSubmitButton = pageHTML.includes('type="submit"');
-
-console.log(`🔍 На странице: форма=${hasForm}, submit кнопка=${hasSubmitButton}`);
-
-let navigationOccurred = false;
-
-// Способ 1: Клик по кнопке submit
-if (hasSubmitButton) {
-    try {
-        const buttons = await page.$$('button[type="submit"]');
-        if (buttons.length > 0) {
-            console.log(`✅ Найдено ${buttons.length} submit кнопок`);
-            
-            await Promise.all([
-                buttons[0].click(),
-                page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 })
-                    .then(() => {
-                        navigationOccurred = true;
-                        console.log('✅ Навигация произошла после клика');
-                    })
-                    .catch(() => console.log('⚠️ Навигация не произошла'))
-            ]);
-        }
-    } catch (e) {
-        console.log('⚠️ Способ 1 не сработал');
-    }
-}
-
-// Способ 2: Submit формы напрямую
-if (!navigationOccurred && hasForm) {
-    try {
-        console.log('📝 Пробуем submit формы...');
-        
-        await Promise.all([
-            page.evaluate(() => {
-                const form = document.querySelector('form') as HTMLFormElement;
-                if (form) form.submit();
-            }),
-            page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 })
-                .then(() => {
-                    navigationOccurred = true;
-                    console.log('✅ Навигация произошла после form.submit()');
-                })
-                .catch(() => console.log('⚠️ Навигация не произошла'))
-        ]);
-    } catch (e) {
-        console.log('⚠️ Способ 2 не сработал');
-    }
-}
-
-// Способ 3: Переход напрямую
-if (!navigationOccurred) {
-    console.log('🔄 Форма не отправилась, переходим на /sign напрямую...');
-    await page.goto('https://my.drom.ru/sign', { 
-        waitUntil: 'domcontentloaded',
-        timeout: 30000 
-    });
-    await new Promise(r => setTimeout(r, 3000));
-}
-
-await takeDebugScreenshot(page, login, '03_10_after_captcha_submit');
-
-// Теперь должна быть форма входа
-const currentUrl = page.url();
-console.log(`📍 Текущий URL: ${currentUrl}`);
-
-// НЕ проверяем наличие формы здесь, просто продолжаем код
-// Проверка будет в блоке "Ввод логина и пароля"
-
-            
-        } catch (captchaError: any) {
-            console.error('❌ Ошибка при решении reCAPTCHA:', captchaError.message);
-            await takeDebugScreenshot(page, login, '03_8_captcha_error');
-            await browser.close();
-            throw new Error(`Failed to solve reCAPTCHA: ${captchaError.message}`);
-        }
-    } else {
-        console.log('✅ reCAPTCHA не обнаружена');
-        
-        // Проверяем, есть ли форма входа
-        const loginField = await page.$('input[name="sign"]');
-        if (!loginField) {
-            console.warn('⚠️ Форма входа не найдена, возможно страница загружается');
-            await takeDebugScreenshot(page, login, '03_6_no_form');
-            
-            // Ждём ещё 5 секунд
-            console.log('⏳ Дополнительное ожидание формы входа...');
-            await new Promise(r => setTimeout(r, 5000));
-            await takeDebugScreenshot(page, login, '03_7_after_additional_wait');
-        }
-    }
-
-} catch (e) {
-    console.error('❌ Ошибка загрузки страницы логина:', e);
-    await takeDebugScreenshot(page, login, '03_login_page_load_error');
-    await browser.close();
-    throw e;
-}
-
-
-    // 3. Ввод логина и пароля
-    const loginInputSelector = 'input[name="sign"]';
-    try {
-        await page.waitForSelector(loginInputSelector, { visible: true, timeout: 30000 });
-        console.log('✅ Поле логина найдено');
-        await takeDebugScreenshot(page, login, '04_login_field_found');
-
-        // Вводим логин
-        console.log('⌨️ Ввод логина...');
-        await page.click(loginInputSelector);
-        await humanDelay(500, 1000);
-        await page.type(loginInputSelector, login, { delay: 100 + Math.random() * 50 });
-        await humanDelay(500, 1000);
-        await takeDebugScreenshot(page, login, '05_login_entered');
-
-        // Вводим пароль
-        console.log('⌨️ Ввод пароля...');
-        const passwordSelector = 'input[type="password"]';
-        await page.click(passwordSelector);
-        await humanDelay(500, 1000);
-        await page.type(passwordSelector, password, { delay: 100 + Math.random() * 50 });
-        await humanDelay(800, 1500);
-        await takeDebugScreenshot(page, login, '06_password_entered');
-
-        // Нажимаем кнопку входа
-        console.log('🔘 Поиск кнопки входа...');
-
-        const buttonExists = await page.$('#signbutton');
-        if (buttonExists) {
-            console.log('✅ Найдена кнопка #signbutton');
-
-            // Скроллим к кнопке
-            await page.evaluate(() => {
-                const btn = document.querySelector('#signbutton');
-                if (btn) btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            });
-
-            await humanDelay(500, 1000);
-            await page.click('#signbutton');
-            console.log('✅ Клик по кнопке входа выполнен');
-
-        } else {
-            console.log('⚠️ Кнопка #signbutton не найдена, пробуем fallback');
-            await page.click('button[type="submit"]');
-            console.log('✅ Клик по button[type="submit"] выполнен');
-        }
-
-        // Ждем реакции страницы
-        console.log('⏳ Ожидание реакции после клика...');
-        await Promise.race([
-            page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 10000 })
-                .then(() => console.log('✅ Произошла навигация'))
-                .catch(() => console.log('⚠️ Навигация не обнаружена')),
-            page.waitForSelector('input[name="code"]', { timeout: 10000 })
-                .then(() => console.log('✅ Появилось поле для кода'))
-                .catch(() => console.log('⚠️ Поле кода не появилось')),
-            new Promise(r => setTimeout(r, 5000))
-        ]);
-
-        await takeDebugScreenshot(page, login, '07_after_login_click');
-
-    } catch (e: any) {
-        console.error('❌ Ошибка при вводе логина/пароля:', e.message);
-        await takeDebugScreenshot(page, login, '08_login_input_error');
-        await browser.close();
-        throw e;
-    }
-
-// 4. Проверка 2FA
-const currentUrl = page.url();
-console.log(`📍 Текущий URL: ${currentUrl}`);
-await takeDebugScreenshot(page, login, '08_checking_2fa');
-
-const codeInput = await page.$('input[name="code"]');
-
-if (codeInput || currentUrl.includes('/sign')) { 
-    console.log('📱 Drom запрашивает код подтверждения');
-    await takeDebugScreenshot(page, login, '09_verification_required');
-
-    // Поиск и клик по кнопке/ссылке SMS
-    console.log('📤 Ищем кнопку/ссылку отправки кода...');
-    
-    let smsButtonClicked = false;
-
-    // ТОЧНЫЙ СПОСОБ: Ссылка с классом "bzr-btn" и текстом "Отправить код на телефон"
-    try {
-        // Из логов видно:
-        // "text": "Отправить код на телефон",
-        // "href": "/sign/s2/33VaDHtEw5WrlT48-3OUmQ/sms?return=%2Fpersonal%2F",
-        // "class": "bzr-btn"
-        
-        console.log('🎯 Способ 1: Ищем ссылку <a class="bzr-btn"> с текстом "Отправить код на телефон"');
-        
-        const smsLink = await page.$('a.bzr-btn:not(.bzr-btn_style_info)');
-        
-        if (smsLink) {
-            const linkText = await page.evaluate(el => el.textContent?.trim(), smsLink);
-            const linkHref = await page.evaluate(el => el.getAttribute('href'), smsLink);
-            
-            console.log(`✅ Найдена ссылка: "${linkText}", href: "${linkHref}"`);
-            
-            // Важно: Используем navigation promise для отслеживания перехода
-            await Promise.all([
-                smsLink.click(),
-                page.waitForNavigation({ 
-                    waitUntil: 'domcontentloaded', 
-                    timeout: 10000 
-                }).catch(() => {
-                    console.log('⚠️ Навигация не произошла, возможно AJAX');
-                })
-            ]);
-            
-            smsButtonClicked = true;
-            console.log('📤 SMS запрошена (способ 1)');
-        } else {
-            console.log('⚠️ Способ 1: Ссылка не найдена');
-        }
-    } catch (e: any) {
-        console.log('⚠️ Способ 1 ошибка:', e.message);
-    }
-
-    // СПОСОБ 2: XPath для точной ссылки
-    if (!smsButtonClicked) {
-        try {
-            console.log('🎯 Способ 2: XPath с точным текстом');
-            
-            const [smsLink] = await page.$$("//a[contains(@class, 'bzr-btn') and contains(normalize-space(.), 'Отправить код на телефон')]");
-            
-            if (smsLink) {
-                console.log('✅ Найдена ссылка через XPath');
-                
-                await Promise.all([
-                    smsLink.click(),
-                    page.waitForNavigation({ 
-                        waitUntil: 'domcontentloaded', 
-                        timeout: 10000 
-                    }).catch(() => console.log('⚠️ Навигация не произошла'))
-                ]);
-                
-                smsButtonClicked = true;
-                console.log('📤 SMS запрошена (способ 2)');
-            }
-        } catch (e: any) {
-            console.log('⚠️ Способ 2 ошибка:', e.message);
-        }
-    }
-
-    // СПОСОБ 3: Прямой переход по href
-    if (!smsButtonClicked) {
-        try {
-            console.log('🎯 Способ 3: Извлекаем href и переходим напрямую');
-            
-            const smsHref = await page.evaluate(() => {
-                const link = document.querySelector('a.bzr-btn:not(.bzr-btn_style_info)');
-                return link?.getAttribute('href');
-            });
-            
-            if (smsHref) {
-                console.log(`✅ Найден href: ${smsHref}`);
-                
-                // Если href относительный, делаем его абсолютным
-                const absoluteUrl = smsHref.startsWith('http') 
-                    ? smsHref 
-                    : new URL(smsHref, 'https://my.drom.ru').href;
-                
-                console.log(`🔗 Переходим на: ${absoluteUrl}`);
-                
-                await page.goto(absoluteUrl, { 
-                    waitUntil: 'domcontentloaded',
-                    timeout: 10000 
-                });
-                
-                smsButtonClicked = true;
-                console.log('📤 SMS запрошена (способ 3 - прямой переход)');
-            }
-        } catch (e: any) {
-            console.log('⚠️ Способ 3 ошибка:', e.message);
-        }
-    }
-
-    // СПОСОБ 4: Клик в контексте страницы
-    if (!smsButtonClicked) {
-        try {
-            console.log('🎯 Способ 4: Клик через evaluate (в контексте страницы)');
-            
-            const clicked = await page.evaluate(() => {
-                const links = Array.from(document.querySelectorAll('a'));
-                
-                for (const link of links) {
-                    const text = link.textContent?.trim().toLowerCase() || '';
-                    if (text.includes('отправить код на телефон')) {
-                        link.click();
-                        return true;
-                    }
-                }
-                return false;
-            });
-            
-            if (clicked) {
-                console.log('✅ Клик выполнен через evaluate');
-                
-                // Ждём навигации или изменения DOM
-                await Promise.race([
-                    page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 5000 }).catch(() => null),
-                    page.waitForFunction(
-                        () => document.querySelector('input[name="code"]'),
-                        { timeout: 5000 }
-                    ).catch(() => null),
-                    new Promise(r => setTimeout(r, 5000))
-                ]);
-                
-                smsButtonClicked = true;
-                console.log('📤 SMS запрошена (способ 4)');
-            }
-        } catch (e: any) {
-            console.log('⚠️ Способ 4 ошибка:', e.message);
-        }
-    }
-
-    if (!smsButtonClicked) {
-        console.error('❌ Не удалось нажать кнопку отправки SMS!');
-        await takeDebugScreenshot(page, login, '09_5_sms_button_not_found');
-    } else {
-        console.log('✅ Кнопка/ссылка SMS успешно нажата!');
-    }
-
-    // Ждём появления поля для кода или изменения страницы
-    await new Promise(r => setTimeout(r, 3000));
-    await takeDebugScreenshot(page, login, '10_sms_requested');
-    
-    // Проверяем результат
-    const currentUrlAfter = page.url();
-    const codeInputAfter = await page.$('input[name="code"]');
-    
-    console.log(`📍 URL после клика: ${currentUrlAfter}`);
-    console.log(`📝 Поле кода ${codeInputAfter ? 'появилось ✅' : 'не появилось ❌'}`);
-
-    activeFlows.set(login, {
-        browser, 
-        page,
-        timestamp: Date.now(),
-        timer: setTimeout(() => cleanupFlow(login), 300 * 1000)
-    });
-
-    return {
-        success: false,
-        needsVerification: true,
-        message: 'Требуется код подтверждения. Отправьте его в следующем запросе.'
-    };
-}
-
-
-
-    await takeDebugScreenshot(page, login, '11_login_success');
-    console.log('✅ Вход выполнен успешно');
-
-    return { success: true, browser, page };
-}
-
-
-async function humanClick(page: any, selector: string) {
-    try {
-        await page.waitForSelector(selector, { visible: true, timeout: 5000 });
-        const element = await page.$(selector);
-        
-        if (element) {
-            const box = await element.boundingBox();
-            if (box) {
-                await page.mouse.move(
-                    box.x + box.width / 2 + (Math.random() - 0.5) * 10,
-                    box.y + box.height / 2 + (Math.random() - 0.5) * 10,
-                    { steps: 10 }
-                );
-                await new Promise(r => setTimeout(r, Math.random() * 200 + 100));
-                await element.click();
-                return true;
-            }
-        }
-    } catch (e) {
-        // Element not found or not visible
-    }
-    return false;
-}
-async function getBrowserInstance(proxyServer?: string) {
-    const launchOptions: any = {
-        headless: "new",
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--window-size=1366,768',
-            '--disable-blink-features=AutomationControlled',  // 🆕 КРИТИЧЕСКИ ВАЖНО!
-            '--disable-features=IsolateOrigins,site-per-process',
-            '--disable-web-security',
-        ],
-        ignoreHTTPSErrors: true,
-        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH
-    };
-
-    if (proxyServer) {
-        launchOptions.args.push(`--proxy-server=${proxyServer}`);
-    }
-
-    return await puppeteer.launch(launchOptions);
-}
-
-// 🆕 УЛУЧШЕННАЯ ФУНКЦИЯ ОЧИСТКИ КОНТЕКСТА ПЕРЕД ЗАГРУЗКОЙ НОВОЙ СЕССИИ
-async function clearBrowserContext(page: any): Promise<void> {
-    try {
-        console.log('🧹 Очистка контекста браузера...');
-
-        // Удаляем все cookies
         const cookies = await page.cookies();
-        if (cookies.length > 0) {
-            await page.deleteCookie(...cookies);
-        }
-
-        // Очищаем localStorage и sessionStorage
-        await page.evaluate(() => {
-            localStorage.clear();
-            sessionStorage.clear();
+        const localStorageData = await page.evaluate(() => {
+            const data: any[] = [];
+            for (let i = 0; i < localStorage.length; i++) {
+                const key = localStorage.key(i);
+                if (key) data.push({ name: key, value: localStorage.getItem(key) });
+            }
+            return data;
         });
 
-        console.log('✅ Контекст браузера очищен');
-    } catch (error) {
-        console.error('⚠️ Ошибка при очистке контекста:', error);
+        const state = { cookies, localStorage: localStorageData };
+        fs.writeFileSync(getSessionPath(login), JSON.stringify(state, null, 2));
+        console.log(`💾 Сессия сохранена для ${login}`);
+    } catch (e) {
+        console.error('Ошибка сохранения сессии:', e);
+    } finally {
+        await browser.close().catch(() => {});
     }
 }
-
-// 🆕 УЛУЧШЕННАЯ ФУНКЦИЯ ЗАГРУЗКИ СЕССИИ С ПРОВЕРКОЙ
-async function loadSessionIfExists(login: string, page: any): Promise<boolean> {
-    const sessionPath = getSessionPath(login);
-
-    if (!fs.existsSync(sessionPath)) {
-        console.log(`📭 Сессия для ${login} не найдена`);
-        return false;
-    }
-
-    try {
-        const state = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
-
-        // 🆕 Проверяем, что сессия принадлежит нужному логину
-        if (state.login && state.login !== login) {
-            console.log(`⚠️ Сессия принадлежит другому логину (${state.login}), очищаем...`);
-            await clearBrowserContext(page);
-            return false;
-        }
-
-        // 🆕 Проверяем возраст сессии (опционально, можно добавить лимит)
-        const sessionAge = Date.now() - (state.timestamp || 0);
-        const maxAge = 7 * 24 * 60 * 60 * 1000; // 7 дней
-        if (sessionAge > maxAge) {
-            console.log(`⚠️ Сессия устарела (${Math.round(sessionAge / 86400000)} дней), требуется повторный вход`);
-            fs.unlinkSync(sessionPath);
-            return false;
-        }
-
-        // Очищаем контекст перед загрузкой новой сессии
-        await clearBrowserContext(page);
-
-        // Загружаем cookies
-        if (state.cookies && state.cookies.length > 0) {
-            await page.setCookie(...state.cookies);
-            console.log(`🍪 Загружено ${state.cookies.length} cookies`);
-        }
-
-        // Загружаем localStorage
-        if (state.localStorage && state.localStorage.length > 0) {
-            await page.evaluateOnNewDocument((data: any[]) => {
-                data.forEach(item => {
-                    if (item.name && item.value) {
-                        localStorage.setItem(item.name, item.value);
-                    }
-                });
-            }, state.localStorage);
-            console.log(`📦 Загружено ${state.localStorage.length} записей localStorage`);
-        }
-
-        console.log(`✅ Сессия успешно загружена для ${login}`);
-        return true;
-    } catch (error) {
-        console.error(`⚠️ Ошибка загрузки сессии для ${login}:`, error);
-        return false;
-    }
-}
-
-// 🆕 НОВЫЙ ENDPOINT ДЛЯ ЯВНОГО ЛОГАУТА
-app.post('/drom/logout', async (req: Request, res: Response) => {
-    const { login } = req.body;
-
-    if (!login) {
-        return res.status(400).json({ error: 'Login required' });
-    }
-
-    let browser;
-    try {
-        console.log(`🚀 Запуск логаута для ${login}...`);
-
-        const launchOptions: any = {
-            headless: true,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-blink-features=AutomationControlled'
-            ]
-        };
-
-        browser = await puppeteer.launch(launchOptions);
-        const page = await browser.newPage();
-        await setupAntiDetection(page);
-        // Загружаем сессию если есть
-        await loadSessionIfExists(login, page);
-
-        // Выполняем логаут
-        await performLogout(page, login);
-
-        // Удаляем файл сессии
-        const sessionPath = getSessionPath(login);
-        if (fs.existsSync(sessionPath)) {
-            fs.unlinkSync(sessionPath);
-            console.log(`🗑️ Файл сессии удален для ${login}`);
-        }
-
-        await browser.close();
-
-        res.json({ 
-            success: true, 
-            message: `Logout successful for ${login}` 
-        });
-
-    } catch (error: any) {
-        console.error('Logout error:', error.message);
-        if (browser) await browser.close().catch(() => {});
-        res.status(500).json({ 
-            success: false, 
-            error: error.message 
-        });
-    }
-});
 
 // --- РОУТЫ ---
 
-// 1. ПОЛУЧЕНИЕ СООБЩЕНИЙ
 // 1. ПОЛУЧЕНИЕ СООБЩЕНИЙ
 app.post('/drom/get-messages', async (req: Request, res: Response) => {
     const { login, password, verificationCode, proxy } = req.body;
@@ -1084,7 +553,6 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
 
     let browserData;
     try {
-        // Вход или завершение 2FA
         if (verificationCode) {
             browserData = await completeLoginFlow(login, verificationCode);
         } else {
@@ -1095,209 +563,93 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
 
         const { page, browser } = browserData;
         console.log('💬 Загрузка списка диалогов...');
+        
+        await page.goto('https://my.drom.ru/personal/messaging-modal?switchPosition=dialogs', { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-        // Переход на страницу диалогов с более надежным ожиданием
-        await page.goto('https://my.drom.ru/personal/messaging-modal?switchPosition=dialogs', { 
-            waitUntil: 'networkidle0',  // Ждем полной загрузки без активных запросов
-            timeout: 60000 
-        });
-
-        // Ждем стабилизации страницы
-        await new Promise(r => setTimeout(r, 3000));
-
-        // Проверяем, не произошел ли редирект на страницу входа
-        const currentUrl = page.url();
-        console.log(`📍 Текущий URL: ${currentUrl}`);
-
-        if (currentUrl.includes('/sign')) {
-            console.log('⚠️ Сессия истекла, требуется повторный вход');
-            await takeDebugScreenshot(page, login, 'session_expired_dialogs');
-            await browser.close();
-            return res.status(401).json({ 
-                success: false, 
-                error: 'Session expired, please login again' 
-            });
-        }
-
-        // Ждем появления списка диалогов
         try {
             await page.waitForSelector('.dialog-list__li', { timeout: 10000 });
-            console.log('✅ Список диалогов загружен');
         } catch {
-            console.log('📭 Диалогов нет');
-            await takeDebugScreenshot(page, login, 'no_dialogs');
+            console.log('Диалогов нет');
             await saveStateAndClose(login, browser, page);
             return res.json({ success: true, count: 0, dialogs: [] });
         }
 
-        // Извлекаем список dialogId с защитой от ошибок context
-        let dialogsList;
-        try {
-            dialogsList = await page.evaluate(() => {
-                return Array.from(document.querySelectorAll('.dialog-list__li'))
-                    .map(el => {
-                        const href = el.querySelector('a[href*="/messaging/view"]')?.getAttribute('href');
-                        const match = href?.match(/dialogId=([^&]+)/);
-                        return match ? { dialogId: match[1] } : null;
-                    })
-                    .filter(Boolean);
-            });
-            console.log(`📋 Найдено диалогов: ${dialogsList.length}`);
-        } catch (e: any) {
-            console.error('❌ Ошибка при извлечении списка диалогов:', e.message);
-            await takeDebugScreenshot(page, login, 'error_extract_dialogs');
-            await browser.close();
-            return res.status(500).json({ 
-                success: false, 
-                error: 'Failed to extract dialog list: ' + e.message 
-            });
-        }
-
-        if (!dialogsList || dialogsList.length === 0) {
-            console.log('📭 Список диалогов пуст');
-            await saveStateAndClose(login, browser, page);
-            return res.json({ success: true, count: 0, dialogs: [] });
-        }
+        const dialogsList = await page.evaluate(() => {
+            return Array.from(document.querySelectorAll('.dialog-list__li'))
+                .map(el => {
+                    const href = el.querySelector('a[href*="/messaging/view"]')?.getAttribute('href');
+                    const match = href?.match(/dialogId=([^&]+)/);
+                    return match ? { dialogId: match[1] } : null;
+                })
+                .filter(Boolean);
+        });
 
         const limit = Math.min(dialogsList.length, 10);
-        console.log(`📋 Обработка ${limit} из ${dialogsList.length} диалогов...`);
+        console.log(`📋 Обработка ${limit} диалогов...`);
         const detailedDialogs = [];
 
-        // Обрабатываем каждый диалог
         for (let i = 0; i < limit; i++) {
             const dItem: any = dialogsList[i];
-
             try {
-                console.log(`🔄 Обработка диалога ${i + 1}/${limit} (ID: ${dItem.dialogId})...`);
-
-                // Переход на страницу конкретного диалога
-                await page.goto(`https://my.drom.ru/personal/messaging/view?dialogId=${dItem.dialogId}`, { 
-                    waitUntil: 'networkidle0',
-                    timeout: 30000 
-                });
-
-                // Небольшая задержка для стабилизации
-                await new Promise(r => setTimeout(r, 1500));
-
-                // Проверяем редирект
-                if (page.url().includes('/sign')) {
-                    console.log('⚠️ Сессия истекла во время обработки диалога');
-                    break;
-                }
-
-                // Ждем загрузки контента диалога
+                // В Puppeteer сложнее кликнуть по конкретному элементу из списка, проще перейти по URL
+                await page.goto(`https://my.drom.ru/personal/messaging/view?dialogId=${dItem.dialogId}`, { waitUntil: 'domcontentloaded' });
+                
                 try {
-                    await page.waitForSelector('.bzr-dialog__inner', { timeout: 8000 });
-                } catch(e) { 
-                    console.log(`⚠️ Диалог ${dItem.dialogId} не загрузился, пропускаем`);
-                    continue; 
-                }
+                     await page.waitForSelector('.bzr-dialog__inner', { timeout: 8000 });
+                } catch(e) { continue; }
 
-                // Извлекаем детали диалога с защитой
-                let details;
-                try {
-                    details = await page.evaluate(() => {
-                        const carLink = document.querySelector('.bzr-dialog-header__sub-title a');
-                        const carTitle = carLink?.textContent?.trim() || '';
-                        let carUrl = carLink?.getAttribute('href') || '';
-                        if (carUrl && carUrl.startsWith('//')) carUrl = 'https:' + carUrl;
+                const details = await page.evaluate(() => {
+                    const carLink = document.querySelector('.bzr-dialog-header__sub-title a');
+                    const carTitle = carLink?.textContent?.trim() || '';
+                    let carUrl = carLink?.getAttribute('href') || '';
+                    if (carUrl && carUrl.startsWith('//')) carUrl = 'https:' + carUrl;
 
-                        const allMessages = Array.from(document.querySelectorAll('.bzr-dialog__message'));
-                        const buffer: string[] = [];
-                        let lastTime = '';
+                    const allMessages = Array.from(document.querySelectorAll('.bzr-dialog__message'));
+                    const buffer: string[] = [];
+                    let lastTime = '';
 
-                        // Собираем последние входящие сообщения (до первого исходящего)
-                        for (let j = allMessages.length - 1; j >= 0; j--) {
-                            const msg = allMessages[j];
-
-                            // Если встретили исходящее - останавливаемся
-                            if (msg.classList.contains('bzr-dialog__message_out')) {
-                                break;
-                            }
-
-                            // Собираем входящие
-                            if (msg.classList.contains('bzr-dialog__message_in')) {
-                                const text = msg.querySelector('.bzr-dialog__text')?.textContent?.trim() || '';
-                                if (text) buffer.unshift(text);
-
-                                if (!lastTime) {
-                                    lastTime = msg.querySelector('.bzr-dialog__message-dt')?.textContent?.trim() || '';
-                                }
+                    for (let j = allMessages.length - 1; j >= 0; j--) {
+                        const msg = allMessages[j];
+                        if (msg.classList.contains('bzr-dialog__message_out')) {
+                            break;
+                        }
+                        if (msg.classList.contains('bzr-dialog__message_in')) {
+                            const text = msg.querySelector('.bzr-dialog__text')?.textContent?.trim() || '';
+                            if (text) buffer.unshift(text);
+                            if (!lastTime) {
+                                lastTime = msg.querySelector('.bzr-dialog__message-dt')?.textContent?.trim() || '';
                             }
                         }
-
-                        const combinedText = buffer.join('\n');
-                        return {
-                            carTitle,
-                            carUrl,
-                            lastIncomingText: combinedText,
-                            lastIncomingTime: lastTime
-                        };
-                    });
-                } catch (e: any) {
-                    console.error(`❌ Ошибка при извлечении данных диалога ${dItem.dialogId}:`, e.message);
-                    if (e.message.includes('Execution context was destroyed')) {
-                        console.log('⚠️ Context destroyed, возможно произошел редирект');
-                        await takeDebugScreenshot(page, login, `dialog_${dItem.dialogId}_context_error`);
-                        break; // Прерываем цикл
                     }
-                    continue; // Пропускаем этот диалог
+
+                    const combinedText = buffer.join('\n');
+                    return {
+                        carTitle,
+                        carUrl,
+                        lastIncomingText: combinedText,
+                        lastIncomingTime: lastTime
+                    };
+                });
+
+                if (details.lastIncomingText) {
+                    detailedDialogs.push({ dialogId: dItem.dialogId, ...details });
                 }
 
-                // Добавляем в результат только если есть текст
-                if (details && details.lastIncomingText) {
-                    detailedDialogs.push({ 
-                        dialogId: dItem.dialogId, 
-                        ...details 
-                    });
-                    console.log(`✅ Диалог ${dItem.dialogId} обработан`);
-                } else {
-                    console.log(`⚠️ Диалог ${dItem.dialogId} пуст, пропускаем`);
-                }
+                await new Promise(r => setTimeout(r, Math.random() * 1000 + 500));
 
-                // Случайная задержка между диалогами (имитация человека)
-                await new Promise(r => setTimeout(r, Math.random() * 1500 + 1000));
-
-            } catch (e: any) {
-                console.error(`❌ Критическая ошибка при обработке диалога ${dItem.dialogId}:`, e.message);
-                await takeDebugScreenshot(page, login, `dialog_${dItem.dialogId}_critical_error`);
-                // Продолжаем со следующим диалогом
-                continue;
+            } catch (e) {
+                console.error(`Error dialog ${dItem.dialogId}`, e);
             }
         }
 
-        console.log(`✅ Успешно собрано диалогов: ${detailedDialogs.length} из ${limit}`);
-
-        // Сохраняем сессию и закрываем браузер
+        console.log(`✅ Собрано ${detailedDialogs.length}`);
         await saveStateAndClose(login, browser, page);
-
-        res.json({ 
-            success: true, 
-            count: detailedDialogs.length, 
-            dialogs: detailedDialogs 
-        });
+        res.json({ success: true, count: detailedDialogs.length, dialogs: detailedDialogs });
 
     } catch (err: any) {
-        console.error('🚨 CRITICAL ERROR в /drom/get-messages:', err.message);
-        console.error('Stack:', err.stack);
-
-        // Делаем скриншот при критической ошибке
-        if (browserData?.page) {
-            try {
-                await takeDebugScreenshot(browserData.page, login, 'critical_error_get_messages');
-            } catch {}
-        }
-
-        // Закрываем браузер
-        if (browserData?.browser) {
-            await browserData.browser.close().catch(() => {});
-        }
-
-        res.status(500).json({ 
-            success: false, 
-            error: err.message,
-            details: 'Check server logs for full error details'
-        });
+        console.error('CRITICAL ERROR:', err.message);
+        if (browserData?.browser) await browserData.browser.close().catch(() => {});
+        res.status(500).json({ success: false, error: err.message });
     }
 });
 
@@ -1454,54 +806,9 @@ app.post('/drom/send-offer', async (req: Request, res: Response) => {
     }
 });
 
+
+
 app.get('/health', (_, res) => res.send('OK'));
-// Список всех скриншотов
-app.get('/debug/screenshots', async (req: Request, res: Response) => {
-    const apiKey = req.headers['x-api-key'];
-    if (apiKey !== process.env.API_SECRET) {
-        return res.status(403).json({ error: 'Access denied' });
-    }
-
-    try {
-        const files = fs.readdirSync(DEBUG_DIR);
-        const screenshots = files
-            .filter(f => f.endsWith('.png'))
-            .map(f => {
-                const stats = fs.statSync(path.join(DEBUG_DIR, f));
-                return {
-                    filename: f,
-                    size: stats.size,
-                    created: stats.birthtime
-                };
-            })
-            .sort((a, b) => b.created.getTime() - a.created.getTime());
-        
-        res.json({ screenshots });
-    } catch (e: any) {
-        res.status(500).json({ error: e.message });
-    }
-});
-
-// Скачать конкретный скриншот
-app.get('/debug/screenshot/:filename', async (req: Request, res: Response) => {
-    const apiKey = req.headers['x-api-key'];
-    if (apiKey !== process.env.API_SECRET) {
-        return res.status(403).json({ error: 'Access denied' });
-    }
-
-    try {
-        const filename = req.params.filename;
-        const filepath = path.join(DEBUG_DIR, filename);
-        
-        if (!fs.existsSync(filepath)) {
-            return res.status(404).send('File not found');
-        }
-        
-        res.sendFile(filepath);
-    } catch (e: any) {
-        res.status(500).json({ error: e.message });
-    }
-});
 
 const PORT = Number(process.env.PORT) || 3000;
 app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server on port ${PORT}`));
