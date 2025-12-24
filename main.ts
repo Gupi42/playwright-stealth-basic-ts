@@ -24,6 +24,7 @@ function parseProxy(proxyUrl: string) {
         return null;
     }
 }
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 // === 🛡️ ЗАЩИТА (MIDDLEWARE) ===
 app.use((req, res, next) => {
