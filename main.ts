@@ -344,36 +344,42 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
 
     let proxyConfig = null;
     let proxyServerArg = undefined;
+
     const proxyToUse = proxyUrl || GLOBAL_PROXY_URL;
     if (proxyToUse) {
         proxyConfig = parseProxy(proxyToUse);
-        if (proxyConfig) proxyServerArg = proxyConfig.server;
+        if (proxyConfig) {
+            proxyServerArg = proxyConfig.server;
+            console.log(`🌐 Прокси: ${proxyServerArg}`);
+        }
     }
 
     const browser = await getBrowserInstance(proxyServerArg);
     const page = await browser.newPage();
 
-    if (proxyConfig?.username) {
-        await page.authenticate({ username: proxyConfig.username, password: proxyConfig.password });
+    // Применяем anti-detection
+    await setupAntiDetection(page);
+
+    // Авторизация на прокси
+    if (proxyConfig && proxyConfig.username && proxyConfig.password) {
+        console.log('🔑 Авторизация на прокси...');
+        await page.authenticate({
+            username: proxyConfig.username,
+            password: proxyConfig.password
+        });
     }
-    
+
     await page.setViewport({ width: 1366, height: 768 });
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36');
 
-    // === ШАГ 0: ГЛУБОКАЯ ОЧИСТКА ===
-    console.log(`[${login}] Инициализация: полная очистка контекста...`);
+    // Очистка данных перед входом (CDP Session для чистоты аккаунтов)
     const client = await page.target().createCDPSession();
     await client.send('Network.clearBrowserCookies');
     await client.send('Network.clearBrowserCache');
 
-    // Блокировка ресурсов для скорости (можно отключить, если сайт ведет себя странно)
-    await page.setRequestInterception(true);
-    page.on('request', (req: any) => {
-        if (['image', 'font', 'media'].includes(req.resourceType())) req.abort();
-        else req.continue();
-    });
+    await takeDebugScreenshot(page, login, '01_initialized');
 
-    // 1. Попытка восстановить сессию именно для этого логина
+    // 1. Попытка восстановить сессию
     const sessionPath = getSessionPath(login);
     if (fs.existsSync(sessionPath)) {
         try {
@@ -386,137 +392,137 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
                 }, state.localStorage);
             }
 
-            console.log(`🔄 [${login}] Проверка существующей сессии...`);
-            await page.goto('https://my.drom.ru/personal/', { waitUntil: 'networkidle2', timeout: 60000 });
-            
-            if (!page.url().includes('sign')) {
-                console.log('✅ Сессия жива, вход выполнен автоматически');
-                return { success: true, browser, page };
-            }
-            console.log('⚠️ Сессия просрочена, переходим к логину');
-        } catch (e) { console.log('Ошибка восстановления сессии'); }
+            console.log(`🔄 Пробуем восстановить сессию для ${login}...`);
+            try {
+                await loadPageWithRetry(page, 'https://my.drom.ru/personal/');
+                if (!page.url().includes('sign')) {
+                    console.log('✅ Сессия восстановлена');
+                    return { success: true, browser, page };
+                }
+            } catch (e) { console.log('⚠️ Сессия не подошла'); }
+        } catch (e) { console.error('Ошибка чтения сессии', e); }
     }
 
-    // 2. Вход по паролю
-    console.log(`🔐 [${login}] Переход на страницу входа...`);
-    await page.goto('https://my.drom.ru/sign', { waitUntil: 'networkidle2', timeout: 60000 });
-
+    // 2. Вход с паролем + reCAPTCHA
+    console.log('🔐 Переход на страницу логина...');
     try {
-        await page.waitForSelector('input[name="sign"]', { visible: true, timeout: 20000 });
+        await loadPageWithRetry(page, 'https://my.drom.ru/sign');
+        await delay(5000); // Ждем подгрузку капчи
+
+        const recaptchaFrame = await page.$('iframe[src*="recaptcha/api2"]');
+        if (recaptchaFrame) {
+            console.log('🔒 Обнаружена reCAPTCHA v2. Решаем...');
+            const sitekey = await page.evaluate(() => {
+                const iframe = document.querySelector('iframe[src*="recaptcha/api2"]') as HTMLIFrameElement;
+                return iframe?.getAttribute('src')?.match(/[?&]k=([^&]+)/)?.[1];
+            });
+
+            if (sitekey && process.env.ANTICAPTCHA_API_KEY) {
+                const gresponse = await solveRecaptchaV2(page.url(), sitekey);
+                await page.evaluate((token: string) => {
+                    const ta = document.querySelector('textarea[name="g-recaptcha-response"]') as any;
+                    if (ta) { ta.innerHTML = token; ta.value = token; }
+                    // Пытаемся вызвать callback если он есть
+                    if ((window as any).grecaptcha) {
+                        const cfg = (window as any).___grecaptcha_cfg?.clients?.[0];
+                        if (cfg?.callback) cfg.callback(token);
+                    }
+                }, gresponse);
+                console.log('✅ Капча решена');
+                await delay(2000);
+            }
+        }
+
+        // Ввод данных
+        await page.waitForSelector('input[name="sign"]', { visible: true, timeout: 15000 });
         await page.type('input[name="sign"]', login, { delay: 100 });
         await page.type('input[type="password"]', password, { delay: 100 });
 
-        console.log('🔘 Нажимаем кнопку "Войти"...');
-        const [button] = await page.$$("xpath/.//button[contains(., 'Войти с паролем')]");
+        console.log('🔘 Нажимаем кнопку входа...');
+        const [submitBtn] = await page.$$("xpath/.//button[contains(., 'Войти')] | //input[@id='signbutton']");
         
-        if (button) {
-            await Promise.all([
-                page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {}),
-                button.click()
-            ]);
-        } else {
-            await Promise.all([
-                page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {}),
-                page.click('button[type="submit"]')
-            ]);
-        }
-        
+        await Promise.all([
+            page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {}),
+            submitBtn ? submitBtn.click() : page.keyboard.press('Enter')
+        ]);
+
+        await takeDebugScreenshot(page, login, '07_after_login_click');
+
     } catch (e: any) {
-        console.error("❌ Ошибка при вводе данных:", e.message);
+        console.error('❌ Ошибка на этапе логина:', e.message);
         await browser.close();
         throw e;
     }
 
-    // 3. ОБРАБОТКА 2FA И ПОИСК КНОПОК
-    await delay(4000); // Даем время на редиректы и загрузку скриптов подтверждения
-    console.log(`📍 [${login}] Проверка этапа подтверждения. URL: ${page.url()}`);
-    await takeDebugScreenshot(page, login, '08_checking_2fa');
-
-    // --- ДЕБАГ: СОБИРАЕМ ВСЕ ЭЛЕМЕНТЫ В ТАБЛИЦУ ---
-    const elementsTable = await page.evaluate(() => {
-        const els = Array.from(document.querySelectorAll('button, a, div[role="button"], span, input[type="button"]'));
-        return els.map(el => ({
-            tag: el.tagName,
-            text: el.textContent?.trim().substring(0, 50) || '',
-            class: (el.getAttribute('class') || '').substring(0, 50),
-            visible: (el as HTMLElement).offsetWidth > 0 && (el as HTMLElement).offsetHeight > 0,
-            name: el.getAttribute('name') || '',
-            id: el.getAttribute('id') || ''
-        })).filter(el => el.text.length > 2 || el.tag === 'INPUT');
+    // 3. Обработка 2FA (УЛУЧШЕННАЯ)
+    await delay(4000);
+    console.log(`📍 Текущий URL: ${page.url()}`);
+    
+    // --- ДЕБАГ ТАБЛИЦА ---
+    const elements = await page.evaluate(() => {
+        return Array.from(document.querySelectorAll('button, a, div[role="button"], input[type="button"]'))
+            .map(el => ({
+                tag: el.tagName,
+                text: el.textContent?.trim() || (el as HTMLInputElement).value || '',
+                visible: (el as HTMLElement).offsetWidth > 0
+            })).filter(el => el.text.length > 2);
     });
+    console.log('🔍 Элементы на странице 2FA:');
+    console.table(elements);
 
-    console.log('🔍 [DEBUG DOM] Список всех интерактивных элементов:');
-    console.table(elementsTable);
-
-    const getCodeInput = () => page.$('input[name="code"]');
-    let codeInput = await getCodeInput();
+    // Проверка, появилось ли поле сразу
+    let codeInput = await page.$('input[name="code"]');
 
     if (!codeInput) {
-        console.log('📱 Поле кода не найдено. Пробуем активировать кнопку получения СМС...');
+        console.log('📱 Поле кода не найдено. Пробуем активировать кнопки...');
 
         const clickResult = await page.evaluate(() => {
-            const searchTexts = ['получить смс-код', 'отправить код', 'код на телефон', 'подтвердить', 'получить код'];
-            const allElements = Array.from(document.querySelectorAll('button, a, div, span, input'));
-            
-            const target = allElements.find(el => {
-                const text = el.textContent?.toLowerCase() || '';
-                const val = (el as HTMLInputElement).value?.toLowerCase() || '';
-                const isVisible = (el as HTMLElement).offsetWidth > 0;
-                return isVisible && (searchTexts.some(t => text.includes(t)) || searchTexts.some(t => val.includes(t)));
+            const targets = ['получить смс-код', 'отправить код', 'код на телефон', 'sms'];
+            const buttons = Array.from(document.querySelectorAll('button, a, div, input'));
+            const found = buttons.find(el => {
+                const content = (el.textContent || (el as HTMLInputElement).value || '').toLowerCase();
+                return targets.some(t => content.includes(t)) && (el as HTMLElement).offsetWidth > 0;
             });
-
-            if (target) {
-                (target as HTMLElement).click();
-                return `Кликнули по [${target.tagName}] со значением "${target.textContent?.trim() || (target as HTMLInputElement).value}"`;
+            if (found) {
+                (found as HTMLElement).click();
+                return found.textContent?.trim() || (found as HTMLInputElement).value;
             }
             return null;
         });
 
         if (clickResult) {
-            console.log(`✅ [Action]: ${clickResult}`);
-            // Ждем появления инпута после клика
-            await page.waitForSelector('input[name="code"]', { timeout: 15000 }).catch(() => {
-                console.log('⚠️ Поле для ввода кода так и не появилось после клика.');
-            });
-        } else {
-            console.log('❌ Кнопка активации СМС не найдена по текстовым шаблонам.');
+            console.log(`🔘 Нажато: "${clickResult}". Ожидаем поле кода...`);
+            await page.waitForSelector('input[name="code"]', { timeout: 15000 }).catch(() => {});
         }
     }
 
-    // Финальная проверка: мы на этапе ввода кода?
     await delay(2000);
-    codeInput = await getCodeInput();
-    
-    if (codeInput) {
-        console.log('🎉 Поле ввода кода доступно. Ожидаем ввод через API.');
-        await takeDebugScreenshot(page, login, '09_ready_for_sms_code');
+    codeInput = await page.$('input[name="code"]');
 
+    if (codeInput) {
+        console.log('✅ Поле ввода кода появилось!');
+        await takeDebugScreenshot(page, login, '09_ready_for_code');
         activeFlows.set(login, {
             browser, page, timestamp: Date.now(),
             timer: setTimeout(() => cleanupFlow(login), 300 * 1000)
         });
-
-        return {
-            success: false,
-            needsVerification: true,
-            message: 'Код запрошен. Пожалуйста, введите его.'
-        };
+        return { success: false, needsVerification: true, message: 'Введите код из СМС' };
     }
 
-    // Если поля нет, возможно мы уже зашли (такое бывает при слабой защите)
-    if (page.url().includes('/personal') || !page.url().includes('sign')) {
-        console.log('🎉 Вход завершен (этап СМС пропущен сайтом)');
+    // Если зашли в личный кабинет напрямую
+    if (page.url().includes('/personal')) {
+        console.log('🎉 Вход выполнен (2FA пропущено)');
         return { success: true, browser, page };
     }
 
-    // Проверка на блокировку
-    const bodyText = await page.evaluate(() => document.body.innerText);
-    if (bodyText.includes('попробуйте позже') || bodyText.includes('много попыток')) {
-        throw new Error('Drom временно заблокировал ваш IP/аккаунт. Попробуйте через час.');
+    // Проверка ошибок блокировки
+    const errorText = await page.evaluate(() => document.body.innerText);
+    if (errorText.includes('попробуйте позже') || errorText.includes('много попыток')) {
+        throw new Error('Drom заблокировал отправку СМС (лимит попыток).');
     }
 
-    await takeDebugScreenshot(page, login, '10_error_final');
-    throw new Error('Не удалось дойти до этапа ввода СМС. Проверьте скриншот 10_error_final и таблицу элементов в логах.');
+    await takeDebugScreenshot(page, login, '10_failed');
+    throw new Error('Не удалось дойти до этапа ввода СМС. См. лог таблицы элементов.');
 }
 
 async function humanClick(page: any, selector: string) {
