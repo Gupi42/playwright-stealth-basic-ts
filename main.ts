@@ -752,11 +752,68 @@ await delay(2000);
     }
 
     // Финальная проверка результата
+    // 4. Проверка 2FA
+    await delay(3000); // Даем время на отрисовку скриптов
+    console.log(`📍 [${login}] Проверка этапа 2FA. URL: ${page.url()}`);
+    
+    // Сбор всех потенциально кликабельных элементов для лога
+    const interactiveElements = await page.evaluate(() => {
+        const els = Array.from(document.querySelectorAll('button, a, div[role="button"], span'));
+        return els
+            .map(el => ({
+                tag: el.tagName,
+                text: el.textContent?.trim() || '',
+                class: el.getAttribute('class') || '',
+                id: el.getAttribute('id') || '',
+                role: el.getAttribute('role') || '',
+                isVisible: (el as HTMLElement).offsetWidth > 0 && (el as HTMLElement).offsetHeight > 0
+            }))
+            .filter(el => el.text.length > 1); // Оставляем только элементы с текстом
+    });
+
+    console.log('🔍 [DEBUG DOM] Список найденных элементов на странице:');
+    console.table(interactiveElements); // Это выведет красивую таблицу в логи Railway
+
+    const getCodeInput = () => page.$('input[name="code"]');
+    let codeInput = await getCodeInput();
+
+    if (!codeInput) {
+        console.log('📱 Поле кода не найдено. Пробуем нажать кнопку активации СМС...');
+
+        const clickSuccess = await page.evaluate(() => {
+            const targets = ['получить смс-код', 'отправить код', 'код на телефон', 'подтвердить'];
+            const els = Array.from(document.querySelectorAll('button, a, div, span'));
+            
+            // Ищем элемент, текст которого содержит одну из фраз
+            const btn = els.find(el => {
+                const txt = el.textContent?.toLowerCase() || '';
+                return targets.some(t => txt.includes(t)) && (el as HTMLElement).offsetWidth > 0;
+            });
+
+            if (btn) {
+                (btn as HTMLElement).click();
+                return (btn as HTMLElement).textContent?.trim();
+            }
+            return null;
+        });
+
+        if (clickSuccess) {
+            console.log(`🔘 Нажали на элемент с текстом: "${clickSuccess}". Ждем появления поля кода...`);
+            // Ждем появления поля input[name="code"]
+            await page.waitForSelector('input[name="code"]', { timeout: 15000 }).catch(() => {
+                console.log('⚠️ Поле кода не появилось после клика.');
+            });
+        } else {
+            console.log('❌ Не удалось найти ни одной кнопки для отправки СМС по тексту.');
+        }
+    }
+
+    // Проверяем результат
     await delay(2000);
     codeInput = await getCodeInput();
-    
+
     if (codeInput) {
-        console.log('✅ УСПЕХ: Поле ввода кода появилось!');
+        console.log('✅ Поле ввода кода доступно!');
         await takeDebugScreenshot(page, login, '09_ready_for_sms');
         
         activeFlows.set(login, {
@@ -768,28 +825,18 @@ await delay(2000);
         return {
             success: false,
             needsVerification: true,
-            message: 'Код запрошен. Ожидаем ввод.'
+            message: 'Код запрошен. Введите его.'
         };
     }
 
-    // Если поля нет, проверим, может мы уже внутри?
-    if (page.url().includes('/personal')) {
-        console.log('🎉 Похоже, зашли без СМС!');
-        return { success: true, browser, page };
+    // Если всё еще не нашли поле, проверяем на ошибки блокировки
+    const bodyHTML = await page.content();
+    if (bodyHTML.includes('попробуйте позже') || bodyHTML.includes('много попыток')) {
+        throw new Error('Drom заблокировал отправку (Too many requests). Подождите час.');
     }
 
-    // ДЕТЕКТОР ОШИБОК (почему не получилось)
-    const pageText = await page.evaluate(() => document.body.innerText);
-    if (pageText.includes('попробуйте позже') || pageText.includes('много попыток')) {
-        throw new Error('Drom заблокировал отправку СМС (слишком много попыток). Подождите 1 час.');
-    }
-    
-    if (pageText.includes('неверный пароль')) {
-        throw new Error('Ошибка: неверный пароль.');
-    }
-
-    await takeDebugScreenshot(page, login, '10_failed_to_find_code_field');
-    throw new Error('Не удалось дойти до этапа ввода СМС кода. Проверьте скриншот 10_failed...');
+    await takeDebugScreenshot(page, login, '10_error_not_found');
+    throw new Error('Не удалось найти поле для кода. Изучите таблицу элементов в логах выше.');
 }
 
 async function humanClick(page: any, selector: string) {
