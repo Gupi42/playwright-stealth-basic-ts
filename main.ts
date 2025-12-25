@@ -372,10 +372,18 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
     await page.setViewport({ width: 1366, height: 768 });
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36');
 
-    // Очистка данных перед входом (CDP Session для чистоты аккаунтов)
-    const client = await page.target().createCDPSession();
-    await client.send('Network.clearBrowserCookies');
-    await client.send('Network.clearBrowserCache');
+    // ВРЕМЕННО ОТКЛЮЧЕНА блокировка ресурсов для стабильности
+    /*
+    await page.setRequestInterception(true);
+    page.on('request', (req: any) => {
+        const type = req.resourceType();
+        if (['image', 'font', 'media', 'stylesheet'].includes(type)) {
+            req.abort();
+        } else {
+            req.continue();
+        }
+    });
+    */
 
     await takeDebugScreenshot(page, login, '01_initialized');
 
@@ -384,145 +392,411 @@ async function startLoginFlow(login: string, password: string, proxyUrl?: string
     if (fs.existsSync(sessionPath)) {
         try {
             const state = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
-            if (state.cookies) await page.setCookie(...state.cookies);
-            if (state.localStorage) {
-                await page.evaluateOnNewDocument((data: any) => {
-                    localStorage.clear();
-                    data.forEach((item: any) => localStorage.setItem(item.name, item.value));
-                }, state.localStorage);
-            }
+            const stats = fs.statSync(sessionPath);
 
-            console.log(`🔄 Пробуем восстановить сессию для ${login}...`);
-            try {
-                await loadPageWithRetry(page, 'https://my.drom.ru/personal/');
-                if (!page.url().includes('sign')) {
-                    console.log('✅ Сессия восстановлена');
-                    return { success: true, browser, page };
+            if (Date.now() - stats.mtimeMs < 30 * 24 * 60 * 60 * 1000) {
+                if (state.cookies && Array.isArray(state.cookies)) {
+                    await page.setCookie(...state.cookies);
                 }
-            } catch (e) { console.log('⚠️ Сессия не подошла'); }
-        } catch (e) { console.error('Ошибка чтения сессии', e); }
+
+                if (state.localStorage) {
+                     await page.evaluateOnNewDocument((data: any) => {
+                        localStorage.clear();
+                        data.forEach((item: any) => localStorage.setItem(item.name, item.value));
+                    }, state.localStorage);
+                }
+
+                console.log(`🔄 Пробуем восстановить сессию для ${login}...`);
+
+                try {
+                   await loadPageWithRetry(page, 'https://my.drom.ru/personal/');
+                   await takeDebugScreenshot(page, login, '02_session_restore_attempt');
+
+                   if (!page.url().includes('sign')) {
+                        console.log('✅ Сессия восстановлена');
+                        await takeDebugScreenshot(page, login, '03_session_restored_success');
+                        return { success: true, browser, page };
+                   }
+                } catch(e) {
+                   console.log('⚠️ Ошибка при переходе с куками:', e);
+                   await takeDebugScreenshot(page, login, '02_session_restore_error');
+                }
+            }
+            console.log('⚠️ Сессия устарела или невалидна, нужен ре-логин');
+        } catch (e) { 
+            console.error('Ошибка чтения сессии', e); 
+        }
     }
 
-    // 2. Вход с паролем + reCAPTCHA
-    console.log('🔐 Переход на страницу логина...');
-    try {
-        await loadPageWithRetry(page, 'https://my.drom.ru/sign');
-        await delay(5000); // Ждем подгрузку капчи
+    // 2. Вход с паролем
+    console.log('🔐 Входим по логину/паролю...');
 
-        const recaptchaFrame = await page.$('iframe[src*="recaptcha/api2"]');
-        if (recaptchaFrame) {
-            console.log('🔒 Обнаружена reCAPTCHA v2. Решаем...');
-            const sitekey = await page.evaluate(() => {
-                const iframe = document.querySelector('iframe[src*="recaptcha/api2"]') as HTMLIFrameElement;
-                return iframe?.getAttribute('src')?.match(/[?&]k=([^&]+)/)?.[1];
-            });
+try {
+    await loadPageWithRetry(page, 'https://my.drom.ru/sign');
+    
+    const content = await page.content();
+    console.log(`📄 Размер загруженной страницы: ${content.length} байт`);
+    
+    if (content.length < 10000) {
+        console.warn(`⚠️ Подозрительно маленькая страница: ${content.length} байт`);
+        await takeDebugScreenshot(page, login, '03_suspicious_small_page');
+        throw new Error('Прокси вернул неполную страницу');
+    }
 
-            if (sitekey && process.env.ANTICAPTCHA_API_KEY) {
-                const gresponse = await solveRecaptchaV2(page.url(), sitekey);
-                await page.evaluate((token: string) => {
-                    const ta = document.querySelector('textarea[name="g-recaptcha-response"]') as any;
-                    if (ta) { ta.innerHTML = token; ta.value = token; }
-                    // Пытаемся вызвать callback если он есть
-                    if ((window as any).grecaptcha) {
-                        const cfg = (window as any).___grecaptcha_cfg?.clients?.[0];
-                        if (cfg?.callback) cfg.callback(token);
-                    }
-                }, gresponse);
-                console.log('✅ Капча решена');
-                await delay(2000);
-            }
+    await takeDebugScreenshot(page, login, '03_login_page_loaded');
+
+    // ========== ОЖИДАНИЕ И ПРОВЕРКА RECAPTCHA ==========
+    console.log('🔍 Ожидание полной загрузки страницы (включая reCAPTCHA)...');
+    
+    // Ждём 5 секунд для загрузки всех асинхронных элементов (включая reCAPTCHA)
+    await new Promise(r => setTimeout(r, 5000));
+    
+    // Дополнительно ждём появления либо формы входа, либо reCAPTCHA
+    await Promise.race([
+        page.waitForSelector('input[name="sign"]', { timeout: 10000 }).catch(() => null),
+        page.waitForSelector('iframe[src*="recaptcha"]', { timeout: 10000 }).catch(() => null),
+        new Promise(r => setTimeout(r, 10000))
+    ]);
+    
+    // Делаем скриншот после ожидания
+    await takeDebugScreenshot(page, login, '03_5_after_wait');
+    
+    // ТЕПЕРЬ проверяем reCAPTCHA
+    const recaptchaFrame = await page.$('iframe[src*="recaptcha/api2"]');
+    
+    if (recaptchaFrame) {
+        console.log('🔒 Обнаружена reCAPTCHA v2!');
+        await takeDebugScreenshot(page, login, '03_6_recaptcha_detected');
+        
+        // Извлекаем sitekey
+        const sitekey = await page.evaluate(() => {
+            const iframe = document.querySelector('iframe[src*="recaptcha/api2"]') as HTMLIFrameElement;
+            if (!iframe) return null;
+            
+            const src = iframe.getAttribute('src') || '';
+            const match = src.match(/[?&]k=([^&]+)/);
+            return match ? match[1] : null;
+        });
+        
+        if (!sitekey) {
+            console.error('❌ Не удалось найти sitekey для reCAPTCHA');
+            await takeDebugScreenshot(page, login, '03_7_no_sitekey');
+            throw new Error('reCAPTCHA sitekey not found');
         }
+        
+        console.log(`🔑 Найден sitekey: ${sitekey}`);
+        
+        // Проверяем API ключ
+        if (!process.env.ANTICAPTCHA_API_KEY) {
+            console.error('❌ ANTICAPTCHA_API_KEY не настроен!');
+            await takeDebugScreenshot(page, login, '03_8_no_api_key');
+            throw new Error('AntiCaptcha API key not configured');
+        }
+        
+        try {
+            // Решаем капчу
+            const gresponse = await solveRecaptchaV2(page.url(), sitekey);
+            
+            // Вставляем решение
+            await page.evaluate((token: string) => {
+                const textarea = document.querySelector('textarea[name="g-recaptcha-response"]') as HTMLTextAreaElement;
+                if (textarea) {
+                    textarea.innerHTML = token;
+                    textarea.value = token;
+                    textarea.style.display = 'block';
+                }
+                
+                const input = document.querySelector('input[name="g-recaptcha-response"]') as HTMLInputElement;
+                if (input) {
+                    input.value = token;
+                }
+                
+                if (typeof (window as any).grecaptcha !== 'undefined') {
+                    const clients = (window as any).___grecaptcha_cfg?.clients;
+                    if (clients) {
+                        Object.keys(clients).forEach((key) => {
+                            const client = clients[key];
+                            if (client && client.callback) {
+                                client.callback(token);
+                            }
+                        });
+                    }
+                }
+            }, gresponse);
+            
+console.log('✅ Решение reCAPTCHA вставлено');
+await new Promise(r => setTimeout(r, 1500));
+await takeDebugScreenshot(page, login, '03_9_recaptcha_solved');
 
-        // Ввод данных
-        await page.waitForSelector('input[name="sign"]', { visible: true, timeout: 15000 });
-        await page.type('input[name="sign"]', login, { delay: 100 });
-        await page.type('input[type="password"]', password, { delay: 100 });
+// Ищем форму/кнопку для submit
+console.log('📤 Поиск способа отправки формы капчи...');
 
-        console.log('🔘 Нажимаем кнопку входа...');
-        const [submitBtn] = await page.$$("xpath/.//button[contains(., 'Войти')] | //input[@id='signbutton']");
+// Проверяем HTML страницы
+const pageHTML = await page.content();
+const hasForm = pageHTML.includes('<form');
+const hasSubmitButton = pageHTML.includes('type="submit"');
+
+console.log(`🔍 На странице: форма=${hasForm}, submit кнопка=${hasSubmitButton}`);
+
+let navigationOccurred = false;
+
+// Способ 1: Клик по кнопке submit
+if (hasSubmitButton) {
+    try {
+        const buttons = await page.$$('button[type="submit"]');
+        if (buttons.length > 0) {
+            console.log(`✅ Найдено ${buttons.length} submit кнопок`);
+            
+            await Promise.all([
+                buttons[0].click(),
+                page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 })
+                    .then(() => {
+                        navigationOccurred = true;
+                        console.log('✅ Навигация произошла после клика');
+                    })
+                    .catch(() => console.log('⚠️ Навигация не произошла'))
+            ]);
+        }
+    } catch (e) {
+        console.log('⚠️ Способ 1 не сработал');
+    }
+}
+
+// Способ 2: Submit формы напрямую
+if (!navigationOccurred && hasForm) {
+    try {
+        console.log('📝 Пробуем submit формы...');
         
         await Promise.all([
-            page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {}),
-            submitBtn ? submitBtn.click() : page.keyboard.press('Enter')
+            page.evaluate(() => {
+                const form = document.querySelector('form') as HTMLFormElement;
+                if (form) form.submit();
+            }),
+            page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 })
+                .then(() => {
+                    navigationOccurred = true;
+                    console.log('✅ Навигация произошла после form.submit()');
+                })
+                .catch(() => console.log('⚠️ Навигация не произошла'))
+        ]);
+    } catch (e) {
+        console.log('⚠️ Способ 2 не сработал');
+    }
+}
+
+// Способ 3: Переход напрямую
+if (!navigationOccurred) {
+    console.log('🔄 Форма не отправилась, переходим на /sign напрямую...');
+    await page.goto('https://my.drom.ru/sign', { 
+        waitUntil: 'domcontentloaded',
+        timeout: 30000 
+    });
+    await new Promise(r => setTimeout(r, 3000));
+}
+
+await takeDebugScreenshot(page, login, '03_10_after_captcha_submit');
+
+// Теперь должна быть форма входа
+const currentUrl = page.url();
+console.log(`📍 Текущий URL: ${currentUrl}`);
+
+// НЕ проверяем наличие формы здесь, просто продолжаем код
+// Проверка будет в блоке "Ввод логина и пароля"
+
+            
+        } catch (captchaError: any) {
+            console.error('❌ Ошибка при решении reCAPTCHA:', captchaError.message);
+            await takeDebugScreenshot(page, login, '03_8_captcha_error');
+            await browser.close();
+            throw new Error(`Failed to solve reCAPTCHA: ${captchaError.message}`);
+        }
+    } else {
+        console.log('✅ reCAPTCHA не обнаружена');
+        
+        // Проверяем, есть ли форма входа
+        const loginField = await page.$('input[name="sign"]');
+        if (!loginField) {
+            console.warn('⚠️ Форма входа не найдена, возможно страница загружается');
+            await takeDebugScreenshot(page, login, '03_6_no_form');
+            
+            // Ждём ещё 5 секунд
+            console.log('⏳ Дополнительное ожидание формы входа...');
+            await new Promise(r => setTimeout(r, 5000));
+            await takeDebugScreenshot(page, login, '03_7_after_additional_wait');
+        }
+    }
+
+} catch (e) {
+    console.error('❌ Ошибка загрузки страницы логина:', e);
+    await takeDebugScreenshot(page, login, '03_login_page_load_error');
+    await browser.close();
+    throw e;
+}
+
+
+    // 3. Ввод логина и пароля
+    const loginInputSelector = 'input[name="sign"]';
+    try {
+        await page.waitForSelector(loginInputSelector, { visible: true, timeout: 30000 });
+        console.log('✅ Поле логина найдено');
+        await takeDebugScreenshot(page, login, '04_login_field_found');
+
+        // Вводим логин
+        console.log('⌨️ Ввод логина...');
+        await page.click(loginInputSelector);
+        await humanDelay(500, 1000);
+        await page.type(loginInputSelector, login, { delay: 100 + Math.random() * 50 });
+        await humanDelay(500, 1000);
+        await takeDebugScreenshot(page, login, '05_login_entered');
+
+        // Вводим пароль
+        console.log('⌨️ Ввод пароля...');
+        const passwordSelector = 'input[type="password"]';
+        await page.click(passwordSelector);
+        await humanDelay(500, 1000);
+        await page.type(passwordSelector, password, { delay: 100 + Math.random() * 50 });
+        await humanDelay(800, 1500);
+        await takeDebugScreenshot(page, login, '06_password_entered');
+
+        // Нажимаем кнопку входа
+        console.log('🔘 Поиск кнопки входа...');
+
+        const buttonExists = await page.$('#signbutton');
+        if (buttonExists) {
+            console.log('✅ Найдена кнопка #signbutton');
+
+            // Скроллим к кнопке
+            await page.evaluate(() => {
+                const btn = document.querySelector('#signbutton');
+                if (btn) btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            });
+
+            await humanDelay(500, 1000);
+            await page.click('#signbutton');
+            console.log('✅ Клик по кнопке входа выполнен');
+
+        } else {
+            console.log('⚠️ Кнопка #signbutton не найдена, пробуем fallback');
+            await page.click('button[type="submit"]');
+            console.log('✅ Клик по button[type="submit"] выполнен');
+        }
+
+        // Ждем реакции страницы
+        console.log('⏳ Ожидание реакции после клика...');
+        await Promise.race([
+            page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 10000 })
+                .then(() => console.log('✅ Произошла навигация'))
+                .catch(() => console.log('⚠️ Навигация не обнаружена')),
+            page.waitForSelector('input[name="code"]', { timeout: 10000 })
+                .then(() => console.log('✅ Появилось поле для кода'))
+                .catch(() => console.log('⚠️ Поле кода не появилось')),
+            new Promise(r => setTimeout(r, 5000))
         ]);
 
         await takeDebugScreenshot(page, login, '07_after_login_click');
 
     } catch (e: any) {
-        console.error('❌ Ошибка на этапе логина:', e.message);
+        console.error('❌ Ошибка при вводе логина/пароля:', e.message);
+        await takeDebugScreenshot(page, login, '08_login_input_error');
         await browser.close();
         throw e;
     }
 
-    // 3. Обработка 2FA (УЛУЧШЕННАЯ)
-    await delay(4000);
-    console.log(`📍 Текущий URL: ${page.url()}`);
-    
-    // --- ДЕБАГ ТАБЛИЦА ---
-    const elements = await page.evaluate(() => {
-        return Array.from(document.querySelectorAll('button, a, div[role="button"], input[type="button"]'))
-            .map(el => ({
-                tag: el.tagName,
-                text: el.textContent?.trim() || (el as HTMLInputElement).value || '',
-                visible: (el as HTMLElement).offsetWidth > 0
-            })).filter(el => el.text.length > 2);
-    });
-    console.log('🔍 Элементы на странице 2FA:');
-    console.table(elements);
+   // 4. Проверка 2FA
+    console.log('📍 Проверка этапа 2FA...');
+    await takeDebugScreenshot(page, login, '08_checking_2fa');
 
-    // Проверка, появилось ли поле сразу
     let codeInput = await page.$('input[name="code"]');
 
     if (!codeInput) {
-        console.log('📱 Поле кода не найдено. Пробуем активировать кнопки...');
+        console.log('🔍 Поле кода не найдено. Начинаем глубокий аудит элементов...');
 
-        const clickResult = await page.evaluate(() => {
-            const targets = ['получить смс-код', 'отправить код', 'код на телефон', 'sms'];
-            const buttons = Array.from(document.querySelectorAll('button, a, div, input'));
-            const found = buttons.find(el => {
-                const content = (el.textContent || (el as HTMLInputElement).value || '').toLowerCase();
-                return targets.some(t => content.includes(t)) && (el as HTMLElement).offsetWidth > 0;
+        // === БЛОК ДЕБАГА: Выводим все потенциальные цели ===
+        const interactables = await page.evaluate(() => {
+            const results: any[] = [];
+            const elements = document.querySelectorAll('button, a, [role="button"], div.bzr-button'); // Добавил типичные классы Drom
+            
+            elements.forEach((el, idx) => {
+                const style = window.getComputedStyle(el);
+                const isVisible = el.getBoundingClientRect().width > 0 && 
+                                 el.getBoundingClientRect().height > 0 && 
+                                 style.display !== 'none' && 
+                                 style.visibility !== 'hidden';
+
+                results.push({
+                    index: idx,
+                    tag: el.tagName,
+                    text: (el as HTMLElement).innerText.trim().replace(/\n/g, ' '),
+                    id: el.id,
+                    class: el.className,
+                    isVisible: isVisible,
+                    href: (el as any).href || 'N/A'
+                });
             });
-            if (found) {
-                (found as HTMLElement).click();
-                return found.textContent?.trim() || (found as HTMLInputElement).value;
-            }
-            return null;
+            return results;
         });
 
-        if (clickResult) {
-            console.log(`🔘 Нажато: "${clickResult}". Ожидаем поле кода...`);
-            await page.waitForSelector('input[name="code"]', { timeout: 15000 }).catch(() => {});
+        console.log('📊 Список найденных интерактивных элементов:');
+        console.table(interactables.filter(item => item.isVisible)); // Выводим только видимые
+
+        // === ПОИСК ЦЕЛИ ===
+        const targetText = 'Получить СМС-код';
+        const target = interactables.find(item => 
+            item.isVisible && item.text.includes(targetText)
+        );
+
+        if (target) {
+            console.log(`🎯 Цель найдена! Тег: ${target.tag}, Класс: ${target.class}`);
+            
+            try {
+                // Пытаемся кликнуть максимально надежно
+                await page.evaluate((idx) => {
+                    const elements = document.querySelectorAll('button, a, [role="button"], div.bzr-button');
+                    const el = elements[idx] as HTMLElement;
+                    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    el.click(); // Прямой JS клик часто надежнее в headless
+                }, target.index);
+
+                console.log('✅ Клик выполнен. Ожидаем появления поля ввода...');
+                
+                // Ждем появления инпута (Drom может тупить, ставим 20 сек)
+                await page.waitForSelector('input[name="code"]', { visible: true, timeout: 20000 });
+                console.log('📱 Поле для кода успешно появилось!');
+                
+            } catch (clickErr: any) {
+                console.error('❌ Ошибка при попытке клика:', clickErr.message);
+            }
+        } else {
+            console.log(`⚠️ Элемент с текстом "${targetText}" не найден среди видимых.`);
+            // Если не нашли, выведем вообще все тексты на странице для анализа
+            const allPageText = await page.evaluate(() => document.body.innerText.substring(0, 500));
+            console.log('📄 Обрывок текста страницы:', allPageText);
         }
     }
 
-    await delay(2000);
-    codeInput = await page.$('input[name="code"]');
-
-    if (codeInput) {
-        console.log('✅ Поле ввода кода появилось!');
-        await takeDebugScreenshot(page, login, '09_ready_for_code');
+    // Если в итоге мы видим поле ввода — сохраняем поток
+    if (await page.$('input[name="code"]')) {
+        console.log('✅ Поле кода подтверждения доступно. Ожидаем ввод в следующем запросе.');
         activeFlows.set(login, {
-            browser, page, timestamp: Date.now(),
+            browser, 
+            page,
+            timestamp: Date.now(),
             timer: setTimeout(() => cleanupFlow(login), 300 * 1000)
         });
-        return { success: false, needsVerification: true, message: 'Введите код из СМС' };
+
+        return {
+            success: false,
+            needsVerification: true,
+            message: 'Код запрошен. Введите его для завершения входа.'
+        };
     }
 
-    // Если зашли в личный кабинет напрямую
-    if (page.url().includes('/personal')) {
-        console.log('🎉 Вход выполнен (2FA пропущено)');
+    // Если кода нет и мы не на странице логина — считаем, что вошли
+    if (!page.url().includes('sign')) {
         return { success: true, browser, page };
     }
 
-    // Проверка ошибок блокировки
-    const errorText = await page.evaluate(() => document.body.innerText);
-    if (errorText.includes('попробуйте позже') || errorText.includes('много попыток')) {
-        throw new Error('Drom заблокировал отправку СМС (лимит попыток).');
-    }
-
-    await takeDebugScreenshot(page, login, '10_failed');
-    throw new Error('Не удалось дойти до этапа ввода СМС. См. лог таблицы элементов.');
+    throw new Error('Не удалось дойти до этапа ввода СМС кода');
 }
 
 async function humanClick(page: any, selector: string) {
