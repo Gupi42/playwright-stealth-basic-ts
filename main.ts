@@ -1371,7 +1371,7 @@ app.post('/drom/send-offer', async (req: Request, res: Response) => {
         } catch(e) {
              throw new Error('Кнопка "Написать" не найдена');
         }
-
+        await humanDelay(500, 1000);
         const modalSelector = 'div[data-ftid="component_modal_content"]';
         await page.waitForSelector(modalSelector, { visible: true, timeout: 5000 });
         
