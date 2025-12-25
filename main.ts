@@ -1363,8 +1363,9 @@ app.post('/drom/send-offer', async (req: Request, res: Response) => {
         console.log(`🚗 Переход к объявлению: ${url}`);
         
         await page.goto(url, { waitUntil: 'domcontentloaded' });
-        
+        await humanDelay(500, 1000);
         // Кнопка "Написать"
+        await takeDebugScreenshot(browserData.page, login, 'car_page_opened');
         const openModalBtnSelector = 'button[data-ga-stats-name="ask_question"]';
         try {
             await humanClick(page, openModalBtnSelector);
