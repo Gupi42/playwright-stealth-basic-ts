@@ -1363,7 +1363,7 @@ app.post('/drom/send-offer', async (req: Request, res: Response) => {
         console.log(`🚗 Переход к объявлению: ${url}`);
         
         await page.goto(url, { waitUntil: 'domcontentloaded' });
-        await humanDelay(500, 1000);
+        await humanDelay(1000, 3000);
         // Кнопка "Написать"
         await takeDebugScreenshot(browserData.page, login, 'car_page_opened');
         const openModalBtnSelector = 'button[data-ga-stats-name="ask_question"]';
@@ -1372,7 +1372,7 @@ app.post('/drom/send-offer', async (req: Request, res: Response) => {
         } catch(e) {
              throw new Error('Кнопка "Написать" не найдена');
         }
-        await humanDelay(500, 1000);
+        await humanDelay(1500, 3000);
         await takeDebugScreenshot(browserData.page, login, 'component_modal_content_opened');
         const modalSelector = 'div[data-ftid="component_modal_content"]';
         await page.waitForSelector(modalSelector, { visible: true, timeout: 5000 });
