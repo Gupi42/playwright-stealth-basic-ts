@@ -702,81 +702,113 @@ console.log(`📍 Текущий URL: ${currentUrl}`);
         throw e;
     }
 
-// 4. Проверка 2FA
+   // 4. Проверка 2FA
     const currentUrl = page.url();
     console.log(`📍 Текущий URL: ${currentUrl}`);
     await takeDebugScreenshot(page, login, '08_checking_2fa');
 
     let codeInput = await page.$('input[name="code"]');
 
+    // Цикл обработки кнопок (может потребоваться несколько кликов)
     if (!codeInput || currentUrl.includes('/sign')) {
-        console.log('📱 Анализ страницы для отправки кода...');
+        console.log('📱 Drom запрашивает подтверждение для отправки кода');
 
-        // === ДЕБАГ: СОБИРАЕМ ВСЕ ИНТЕРАКТИВНЫЕ ЭЛЕМЕНТЫ ===
-        const allElements = await page.evaluate(() => {
-            const items = document.querySelectorAll('button, a, [role="button"]');
-            return Array.from(items).map((el, i) => ({
-                index: i,
-                tag: el.tagName.toLowerCase(),
-                text: el.textContent?.trim() || '',
-                isVisible: (el as HTMLElement).offsetWidth > 0 && (el as HTMLElement).offsetHeight > 0,
-                id: el.id,
-                className: el.className
-            }));
-        });
+        // ШАГ А: Проверяем наличие промежуточной кнопки "Получить СМС-код" (как на скриншоте)
+        const intermediateBtnSelector = "xpath/.//button[contains(., 'Получить СМС-код')] | //a[contains(., 'Получить СМС-код')]";
+        const intermediateBtn = await page.$(intermediateBtnSelector);
 
-        console.log('📊 Аудит кнопок и ссылок на странице:');
-        console.table(allElements.filter(e => e.isVisible && e.text.length > 0));
-
-        // === ПОИСК ЦЕЛИ ПО ПРИОРИТЕТАМ ===
-        let targetIndex = -1;
-
-        // ПРИОРИТЕТ 1: Точное совпадение (как на твоем скриншоте)
-        const primaryText = 'получить смс-код';
-        const primaryMatch = allElements.find(e => e.isVisible && e.text.toLowerCase().includes(primaryText));
-
-        if (primaryMatch) {
-            console.log(`🎯 Найдена основная кнопка: "${primaryMatch.text}"`);
-            targetIndex = primaryMatch.index;
-        } else {
-            // ПРИОРИТЕТ 2: Твои ключевые слова (Step B)
-            console.log('⚠️ Основная кнопка не найдена, ищем по ключевым словам...');
-            const targetTexts = ['отправить код на телефон', 'телефон', 'sms', 'получить код'];
-            const fallbackMatch = allElements.find(e => 
-                e.isVisible && targetTexts.some(t => e.text.toLowerCase().includes(t))
-            );
+        if (intermediateBtn) {
+            console.log('🔘 Найдена промежуточная кнопка "Получить СМС-код", нажимаем...');
+            await Promise.all([
+                page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {}),
+                intermediateBtn.click()
+            ]);
+            await delay(2000);
+            await takeDebugScreenshot(page, login, '09_intermediate_clicked');
             
-            if (fallbackMatch) {
-                console.log(`✅ Найдено по ключевому слову: "${fallbackMatch.text}"`);
-                targetIndex = fallbackMatch.index;
-            }
+            // Проверяем поле кода еще раз после клика
+            codeInput = await page.$('input[name="code"]');
         }
 
-        // === ВЫПОЛНЕНИЕ КЛИКА ===
-        if (targetIndex !== -1) {
-            try {
-                console.log('🔘 Выполняем клик...');
-                
-                await page.evaluate((idx) => {
-                    const elements = document.querySelectorAll('button, a, [role="button"]');
-                    const el = elements[idx] as HTMLElement;
-                    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                    el.click(); // Используем JS-клик для надежности
-                }, targetIndex);
+        // ШАГ Б: Если поля всё еще нет, пробуем старые способы поиска кнопок (выбор способа доставки)
+        if (!codeInput) {
+            console.log('📤 Поле ввода не найдено, ищем кнопки выбора способа отправки (SMS/Звонок)...');
+            
+            let smsButtonClicked = false;
+            // Тексты, которые мы ищем на кнопках или ссылках
+            const targetTexts = ['отправить код на телефон', 'телефон', 'sms', 'получить код'];
 
-                // Вместо waitForNavigation ждем появления инпута
-                console.log('⏳ Ожидание появления поля ввода кода (input[name="code"])...');
-                await page.waitForSelector('input[name="code"]', { visible: true, timeout: 15000 });
-                console.log('✅ Поле ввода появилось!');
+            const clickableElements = await page.evaluate((texts) => {
+                const results: any[] = [];
+                const items = document.querySelectorAll('button, a');
+                items.forEach((el, idx) => {
+                    const content = el.textContent?.toLowerCase() || '';
+                    const isVisible = (el as HTMLElement).offsetWidth > 0 && (el as HTMLElement).offsetHeight > 0;
+                    if (isVisible && texts.some(t => content.includes(t))) {
+                        results.push({ index: idx, tag: el.tagName.toLowerCase(), text: content.trim() });
+                    }
+                });
+                return results;
+            }, targetTexts);
+
+            if (clickableElements.length > 0) {
+                const target = clickableElements[0];
+                console.log(`✅ Выбран элемент для клика: <${target.tag}> с текстом "${target.text}"`);
                 
-                await takeDebugScreenshot(page, login, '09_after_sms_click_success');
-                codeInput = await page.$('input[name="code"]');
-            } catch (e: any) {
-                console.error('❌ Ошибка после клика по кнопке СМС:', e.message);
-                await takeDebugScreenshot(page, login, '09_after_sms_click_error');
+                await Promise.all([
+                    page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {}),
+                    page.evaluate((idx) => {
+                        const items = document.querySelectorAll('button, a');
+                        (items[idx] as HTMLElement).click();
+                    }, target.index)
+                ]);
+                
+                smsButtonClicked = true;
+                await delay(3000);
+                await takeDebugScreenshot(page, login, '10_method_selected');
             }
-        } else {
-            console.error('❌ Ни одна кнопка для отправки СМС не найдена по текстам.');
+
+            let smsButtonClickedToo = false;
+            // Тексты, которые мы ищем на кнопках или ссылках
+            const targetTextsToo = ['получить СМС-код', 'СМС-код', 'получить'];
+
+            const clickableElementsToo = await page.evaluate((texts) => {
+                const results: any[] = [];
+                const items = document.querySelectorAll('button, a');
+                items.forEach((el, idx) => {
+                    const content = el.textContent?.toLowerCase() || '';
+                    const isVisible = (el as HTMLElement).offsetWidth > 0 && (el as HTMLElement).offsetHeight > 0;
+                    if (isVisible && texts.some(t => content.includes(t))) {
+                        results.push({ index: idx, tag: el.tagName.toLowerCase(), text: content.trim() });
+                    }
+                });
+                return results;
+            }, targetTextsToo);
+
+            if (clickableElementsToo.length > 0) {
+                const target = clickableElementsToo[0];
+                console.log(`✅ Выбран элемент для клика: <${target.tag}> с текстом "${target.text}"`);
+                
+                await Promise.all([
+                    page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {}),
+                    page.evaluate((idx) => {
+                        const items = document.querySelectorAll('button, a');
+                        (items[idx] as HTMLElement).click();
+                    }, target.index)
+                ]);
+                
+                smsButtonClicked = true;
+                await delay(3000);
+                await takeDebugScreenshot(page, login, '10_finish_method_selected');
+            }
+
+            // ШАГ В: Проверка финального результата (появилось ли поле ввода)
+            codeInput = await page.$('input[name="code"]');
+            
+            if (!codeInput && !smsButtonClicked) {
+                console.error('❌ Не удалось инициировать отправку СМС. Поле ввода не появилось.');
+                await takeDebugScreenshot(page, login, 'error_no_code_field');
+            }
         }
     }
 
