@@ -12,16 +12,26 @@ puppeteer.use(StealthPlugin());
 const app = express();
 app.use(express.json());
 
-// ===== ГЛОБАЛЬНЫЙ ЭКЗЕМПЛЯР БРАУЗЕРА (КРИТИЧНО!) =====
+// ===== ГЛОБАЛЬНЫЙ ЭКЗЕМПЛЯР БРАУЗЕРА (ИСПРАВЛЕНО!) =====
 let globalBrowser: any = null;
 let browserLaunchInProgress = false;
 
 // ===== ФУНКЦИЯ ПОЛУЧЕНИЯ ИЛИ СОЗДАНИЯ БРАУЗЕРА =====
 async function getBrowserInstance(proxyServer?: string): Promise<any> {
   // Если браузер существует и подключен - возвращаем его
-  if (globalBrowser && globalBrowser.isConnected()) {
-    console.log('♻️ Переиспользуем существующий браузер');
-    return globalBrowser;
+  if (globalBrowser) {
+    try {
+      // Проверяем, что браузер действительно работает
+      const version = await globalBrowser.version();
+      if (version) {
+        console.log('♻️ Переиспользуем существующий браузер');
+        return globalBrowser;
+      }
+    } catch (e) {
+      // Браузер не отвечает, нужно создать новый
+      console.log('⚠️ Старый браузер не отвечает, создаем новый');
+      globalBrowser = null;
+    }
   }
 
   // Если запуск уже в процессе - ждем
@@ -30,8 +40,13 @@ async function getBrowserInstance(proxyServer?: string): Promise<any> {
   }
 
   // Если браузер появился пока ждали - возвращаем его
-  if (globalBrowser && globalBrowser.isConnected()) {
-    return globalBrowser;
+  if (globalBrowser) {
+    try {
+      await globalBrowser.version();
+      return globalBrowser;
+    } catch (e) {
+      globalBrowser = null;
+    }
   }
 
   // Запускаем новый браузер
@@ -43,17 +58,16 @@ async function getBrowserInstance(proxyServer?: string): Promise<any> {
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage', // КРИТИЧНО для Docker
+        '--disable-dev-shm-usage',
         '--disable-gpu',
         '--disable-blink-features=AutomationControlled',
         '--disable-features=IsolateOrigins,site-per-process',
-        '--single-process', // Уменьшает количество процессов
+        '--single-process',
         '--window-size=1366,768',
       ],
       ignoreHTTPSErrors: true,
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
-      // Увеличиваем таймаут протокола
-      protocolTimeout: 180000, // 3 минуты вместо стандартных 30 секунд
+      protocolTimeout: 180000,
     };
 
     if (proxyServer) {
@@ -63,10 +77,15 @@ async function getBrowserInstance(proxyServer?: string): Promise<any> {
     globalBrowser = await puppeteer.launch(launchOptions);
     console.log('✅ Глобальный браузер запущен');
     
-    // Обработчик закрытия браузера
-    globalBrowser.on('disconnected', () => {
-      console.log('⚠️ Браузер отключился');
-      globalBrowser = null;
+    // ✅ ИСПРАВЛЕНО: Более умный обработчик disconnected
+    globalBrowser.on('disconnected', async () => {
+      console.log('⚠️ Браузер отключился неожиданно');
+      // Ждем немного перед сбросом, чтобы избежать ложных срабатываний
+      await new Promise(r => setTimeout(r, 1000));
+      if (globalBrowser && !await checkBrowserAlive(globalBrowser)) {
+        globalBrowser = null;
+        console.log('🔄 Глобальный браузер сброшен');
+      }
     });
 
     return globalBrowser;
@@ -74,6 +93,17 @@ async function getBrowserInstance(proxyServer?: string): Promise<any> {
     browserLaunchInProgress = false;
   }
 }
+
+// ✅ НОВАЯ ФУНКЦИЯ: проверка живости браузера
+async function checkBrowserAlive(browser: any): Promise<boolean> {
+  try {
+    await browser.version();
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
 
 // Хелпер для парсинга прокси
 function parseProxy(proxyUrl: string) {
