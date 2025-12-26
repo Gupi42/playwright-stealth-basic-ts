@@ -1,2 +1,12 @@
-.idea
 ./node_modules
+node_modules
+npm-debug.log
+.git
+.gitignore
+.env
+data/
+debug/
+*.log
+*.md
+.vscode
+.idea
