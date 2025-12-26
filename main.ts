@@ -188,8 +188,8 @@ async function performLogout(page: any, login: string): Promise<void> {
   }
 }
 
-// ===== ИСПРАВЛЕНА ФУНКЦИЯ saveStateAndClose =====
-async function saveStateAndClose(login: string, page: any, skipLogout: boolean = false) {
+// ===== ИСПРАВЛЕННАЯ ФУНКЦИЯ saveStateAndClose =====
+async function saveStateAndClose(login: string, page: any) {
   try {
     const cookies = await page.cookies();
     const localStorageData = await page.evaluate(() => {
@@ -212,14 +212,16 @@ async function saveStateAndClose(login: string, page: any, skipLogout: boolean =
     console.log(`💾 Сессия сохранена для ${login}`);
   } catch (e) {
     console.error('Ошибка сохранения сессии:', e);
-  } finally {
-    // КРИТИЧНО: Закрываем только страницу, НЕ браузер!
-    try {
+  }
+  
+  // КРИТИЧНО: Закрываем страницу ПОСЛЕ сохранения
+  try {
+    if (page && !page.isClosed()) {
       await page.close();
       console.log(`✅ Страница для ${login} закрыта`);
-    } catch (e) {
-      console.error('Ошибка закрытия страницы:', e);
     }
+  } catch (e) {
+    console.error('Ошибка закрытия страницы:', e);
   }
 }
 
@@ -805,7 +807,7 @@ async function loadSessionIfExists(login: string, page: any): Promise<boolean> {
 
 // --- РОУТЫ ---
 
-// 1. ПОЛУЧЕНИЕ СООБЩЕНИЙ
+// 1. ПОЛУЧЕНИЕ СООБЩЕНИЙ - ИСПРАВЛЕННАЯ ВЕРСИЯ
 app.post('/drom/get-messages', async (req: Request, res: Response) => {
   const { login, password, verificationCode, proxy } = req.body;
   if (!login || !password) return res.status(400).json({ error: 'Login/password required' });
@@ -834,7 +836,7 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
     
     if (currentUrl.includes('/sign')) {
       console.log('⚠️ Сессия истекла, требуется повторный вход');
-      await page.close();
+      await saveStateAndClose(login, page);
       return res.status(401).json({
         success: false,
         error: 'Session expired, please login again'
@@ -865,7 +867,7 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
     } catch (e: any) {
       console.error('❌ Ошибка при извлечении списка диалогов:', e.message);
       await takeDebugScreenshot(page, login, 'error_extract_dialogs', true);
-      await page.close();
+      await saveStateAndClose(login, page);
       return res.status(500).json({
         success: false,
         error: 'Failed to extract dialog list: ' + e.message
@@ -968,6 +970,8 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
     }
     
     console.log(`✅ Успешно собрано диалогов: ${detailedDialogs.length} из ${limit}`);
+    
+    // ✅ ВАЖНО: Сохраняем и закрываем страницу ПОСЛЕ завершения всей работы
     await saveStateAndClose(login, page);
     
     res.json({
@@ -984,7 +988,13 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
       try {
         await takeDebugScreenshot(page, login, 'critical_error_get_messages', true);
       } catch {}
-      await page.close().catch(() => {});
+      
+      // При ошибке тоже закрываем страницу
+      try {
+        if (page && !page.isClosed()) {
+          await page.close();
+        }
+      } catch {}
     }
     
     res.status(500).json({
@@ -995,7 +1005,7 @@ app.post('/drom/get-messages', async (req: Request, res: Response) => {
   }
 });
 
-// 2. ОТПРАВКА СООБЩЕНИЯ
+// 2. ОТПРАВКА СООБЩЕНИЯ - ИСПРАВЛЕННАЯ ВЕРСИЯ
 app.post('/drom/send-message', async (req: Request, res: Response) => {
   const { login, password, dialogId, message, proxy } = req.body;
   if (!login || !password || !dialogId || !message) return res.status(400).json({ error: 'Data missing' });
@@ -1007,7 +1017,10 @@ app.post('/drom/send-message', async (req: Request, res: Response) => {
     page = result.page;
     
     console.log(`📤 Отправка в диалог ${dialogId}...`);
-    await page.goto(`https://my.drom.ru/personal/messaging/view?dialogId=${dialogId}`, { waitUntil: 'domcontentloaded' });
+    await page.goto(`https://my.drom.ru/personal/messaging/view?dialogId=${dialogId}`, { 
+      waitUntil: 'domcontentloaded',
+      timeout: 30000 
+    });
     
     const textAreaSelector = 'textarea[name="message"]';
     await page.waitForSelector(textAreaSelector, { visible: true, timeout: 10000 });
@@ -1021,12 +1034,14 @@ app.post('/drom/send-message', async (req: Request, res: Response) => {
     res.json({ success: true });
   } catch (err: any) {
     console.error('Send error:', err.message);
-    if (page) await page.close().catch(() => {});
+    if (page && !page.isClosed()) {
+      await page.close().catch(() => {});
+    }
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// 3. ПОЛУЧЕНИЕ ИЗБРАННОГО
+// 3. ПОЛУЧЕНИЕ ИЗБРАННОГО - ИСПРАВЛЕННАЯ ВЕРСИЯ
 app.post('/drom/get-bookmarks', async (req: Request, res: Response) => {
   const { login, password, verificationCode, proxy } = req.body;
   if (!login || !password) return res.status(400).json({ error: 'Login/pass required' });
@@ -1043,7 +1058,10 @@ app.post('/drom/get-bookmarks', async (req: Request, res: Response) => {
     }
     
     console.log('⭐ Переход в избранное...');
-    await page.goto('https://my.drom.ru/personal/bookmark', { waitUntil: 'domcontentloaded' });
+    await page.goto('https://my.drom.ru/personal/bookmark', { 
+      waitUntil: 'domcontentloaded',
+      timeout: 30000 
+    });
     
     try {
       await page.waitForSelector('.bull-item', { timeout: 8000 });
@@ -1081,12 +1099,14 @@ app.post('/drom/get-bookmarks', async (req: Request, res: Response) => {
     res.json({ success: true, count: bookmarks.length, bookmarks });
   } catch (error: any) {
     console.error('Error bookmarks:', error.message);
-    if (page) await page.close().catch(() => {});
+    if (page && !page.isClosed()) {
+      await page.close().catch(() => {});
+    }
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// 4. ОТПРАВКА ОФФЕРА
+// 4. ОТПРАВКА ОФФЕРА - ИСПРАВЛЕННАЯ ВЕРСИЯ
 app.post('/drom/send-offer', async (req: Request, res: Response) => {
   const { login, password, verificationCode, proxy, url, message } = req.body;
   if (!login || !password || !url || !message) {
@@ -1105,7 +1125,10 @@ app.post('/drom/send-offer', async (req: Request, res: Response) => {
     }
     
     console.log(`🚗 Переход к объявлению: ${url}`);
-    await page.goto(url, { waitUntil: 'domcontentloaded' });
+    await page.goto(url, { 
+      waitUntil: 'domcontentloaded',
+      timeout: 30000 
+    });
     await humanDelay(1000, 3000);
     
     const openModalBtnSelector = 'button[data-ga-stats-name="ask_question"]';
@@ -1135,10 +1158,13 @@ app.post('/drom/send-offer', async (req: Request, res: Response) => {
     res.json({ success: true });
   } catch (error: any) {
     console.error('Offer error:', error.message);
-    if (page) await page.close().catch(() => {});
+    if (page && !page.isClosed()) {
+      await page.close().catch(() => {});
+    }
     res.status(500).json({ success: false, error: error.message });
   }
 });
+
 
 // 5. LOGOUT ENDPOINT
 app.post('/drom/logout', async (req: Request, res: Response) => {
