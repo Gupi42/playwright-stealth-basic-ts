@@ -54,7 +54,7 @@ COPY tsconfig.json ./
 
 # Устанавливаем зависимости
 # Важно: puppeteer не будет скачивать свой Chromium, т.к. мы используем системный Chrome
-RUN npm ci --only=production && npm cache clean --force
+RUN npm install --production && npm cache clean --force
 
 # Копируем исходный код
 COPY . .
