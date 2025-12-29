@@ -1310,7 +1310,7 @@ app.post('/drom/get-bookmarks', async (req: Request, res: Response) => {
 
         const bookmarks = await page.evaluate(() => {
             const items = Array.from(document.querySelectorAll('.bull-item'));
-            return items.slice(0, 10).map(el => {
+            return items.map(el => {
                 const getText = (selector: string) => el.querySelector(selector)?.textContent?.trim().replace(/\s+/g, ' ') || '';
                 const linkNode = el.querySelector('a.bulletinLink');
                 const href = linkNode ? linkNode.getAttribute('href') : '';
