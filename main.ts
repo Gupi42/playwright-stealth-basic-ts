@@ -1318,7 +1318,17 @@ app.post('/drom/get-bookmarks', async (req: Request, res: Response) => {
                 const id = el.getAttribute('data-bulletin-id') || '';
                 const priceRaw = getText('.price-block__price');
                 const price = priceRaw ? priceRaw.replace(/[^\d]/g, '') : '';
+                const noteEl = el.querySelector('.object-note');
+                let userNote = null;
 
+                if (noteEl) {
+                    userNote = {
+                        // Текст заметки (обычно там твоя цена или комментарий)
+                        text: noteEl.querySelector('.object-note-text')?.textContent?.trim() || '',
+                        // Дата/время когда заметка была создана/изменена
+                        date: noteEl.querySelector('.object-note-date')?.textContent?.trim() || ''
+                    };
+                }
                 return {
                     id,
                     title: linkNode?.textContent?.trim() || '',
@@ -1326,7 +1336,8 @@ app.post('/drom/get-bookmarks', async (req: Request, res: Response) => {
                     price: parseInt(price) || 0,
                     city: getText('.bull-delivery__city'),
                     specs: getText('.bull-item__annotation-row'),
-                    date: getText('.date')
+                    date: getText('.date'),
+                    userNote: userNote 
                 };
             });
         });
