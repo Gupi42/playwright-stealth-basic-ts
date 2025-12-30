@@ -1460,5 +1460,26 @@ app.get('/debug/screenshot/:filename', async (req: Request, res: Response) => {
     }
 });
 
+app.get('/system/stats', async (req: Request, res: Response) => {
+    const apiKey = req.headers['x-api-key'];
+    if (apiKey !== process.env.API_SECRET) {
+        return res.status(403).json({ error: 'Access denied' });
+    }
+    
+    const used = process.memoryUsage();
+    
+    res.json({
+        memory: {
+            rss: `${Math.round(used.rss / 1024 / 1024)} MB`,
+            heapUsed: `${Math.round(used.heapUsed / 1024 / 1024)} MB`,
+        },
+        activeSessions: {
+            drom: activeFlows.size,
+            avito: avitoActiveFlows.size,
+        },
+        uptime: `${Math.floor(process.uptime() / 3600)}ч ${Math.floor((process.uptime() % 3600) / 60)}м`,
+    });
+});
+
 const PORT = Number(process.env.PORT) || 3000;
 app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server on port ${PORT}`));
