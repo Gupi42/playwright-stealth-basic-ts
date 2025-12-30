@@ -1474,8 +1474,7 @@ app.get('/system/stats', async (req: Request, res: Response) => {
             heapUsed: `${Math.round(used.heapUsed / 1024 / 1024)} MB`,
         },
         activeSessions: {
-            drom: activeFlows.size,
-            avito: avitoActiveFlows.size,
+            drom: activeFlows.size
         },
         uptime: `${Math.floor(process.uptime() / 3600)}ч ${Math.floor((process.uptime() % 3600) / 60)}м`,
     });
